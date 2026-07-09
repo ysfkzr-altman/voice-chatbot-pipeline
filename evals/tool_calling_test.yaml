@@ -1,0 +1,36 @@
+name: tool_calling_test
+
+# Verifies the check_honda_price tool-calling demo actually gets invoked
+# and fetches REAL, live data from honda.com.pk (not a hardcoded number).
+# Doesn't assert an exact price since Honda can change pricing at any
+# time - just that the tool fired and the reply contains a real PKR figure.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/tool_calling_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "How much does the Honda Civic cost?"
+    expect:
+      - event: function_call
+        name: check_honda_price
+        within_ms: 10000
+      - event: llm_response
+        text_contains: "PKR"
+        within_ms: 15000
+
+  - user: "What about the HR-V?"
+    expect:
+      - event: function_call
+        name: check_honda_price
+        within_ms: 10000
+      - event: llm_response
+        text_contains: "PKR"
+        within_ms: 15000

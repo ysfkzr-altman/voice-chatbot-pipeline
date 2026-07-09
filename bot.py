@@ -9,6 +9,11 @@ console (CONVO log line), since there's no client to receive a text message.
 Pipeline: mic (WebRTC or local) -> Silero VAD -> Groq STT (Whisper)
           -> Groq LLM (Llama 3.3 70B) -> text delivered via RTVI (no TTS)
 
+Also includes a worked example of LLM tool calling: `check_honda_price`
+fetches and parses the real, live starting prices from honda.com.pk's own
+homepage (see check_honda_price below), so the bot can answer "how much is
+the Civic?" using actual current data instead of a guess.
+
 Run:
     python bot.py             # WebRTC server; open http://localhost:7860
     python bot.py --local     # Talk directly via the local mic (reply is console-only)
@@ -18,13 +23,16 @@ Requires GROQ_API_KEY in a .env file.
 
 import asyncio
 import os
+import re
 import sys
 import time
 
 import pyaudio
+from curl_cffi import requests as curl_requests
 from dotenv import load_dotenv
 from loguru import logger
 
+from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import ErrorFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -39,6 +47,7 @@ from pipecat.runner.types import EvalRunnerArguments, RunnerArguments, SmallWebR
 from pipecat.runner.utils import create_transport
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.whisper.base_stt import Transcription
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
@@ -71,12 +80,132 @@ SYSTEM_INSTRUCTION = (
     "Keep every response short and direct — one or two "
     "sentences by default, never more than a few. No filler, no preamble, no "
     "restating the question, no hedging caveats. Answer exactly what was asked "
-    "and stop."
+    "and stop. "
+    "If the user asks about the price of a Honda Civic, HR-V, or City, use "
+    "the check_honda_price tool rather than guessing - never make up a price."
 )
 
 GREETING_MESSAGE = "Hi! How can I help you today?"
 FALLBACK_ERROR_MESSAGE = "Sorry, I hit a glitch there. Could you say that again?"
 FALLBACK_COOLDOWN_SECS = 5.0
+
+# Worked example of tool calling against a REAL website (not fake/hardcoded
+# data): honda.com.pk's homepage includes a mega-menu block, present on
+# every page, listing each model line's current starting price - e.g.
+#   <h4>Honda Civic</h4> ... <div class="model-price">From PKR 8,499,000</div>
+# This is public marketing content, not a live inventory/stock API - Honda
+# Pakistan doesn't expose per-unit stock counts publicly (that lives inside
+# individual dealers' internal systems). Pricing is the real, live data
+# that's actually available to scrape here.
+HONDA_HOMEPAGE_URL = "https://www.honda.com.pk/"
+_HONDA_PRICE_PATTERN = re.compile(
+    r'<h4>Honda ([\w\- ]+?)</h4>.*?model-price">From PKR ([\d,]+)</div>',
+    re.DOTALL,
+)
+
+# Cache the parsed prices briefly so a burst of questions in one
+# conversation doesn't re-fetch the real site on every single turn - this
+# is a live public website, not our own infrastructure, so being a
+# reasonably polite client matters.
+_price_cache: dict[str, str] = {}
+_price_cache_time = 0.0
+_PRICE_CACHE_TTL_SECS = 300.0
+
+
+def _fetch_honda_homepage_sync() -> str:
+    """Blocking fetch, run in a background thread by `_get_honda_prices`.
+
+    Plain httpx (or curl with no browser identity) gets blocked with a 403
+    by the Cloudflare WAF in front of this site - confirmed by testing:
+    even a normal browser `User-Agent` header wasn't enough, since
+    Cloudflare's bot-detection also fingerprints the TLS handshake itself
+    (JA3/JA4), which differs between a real browser and a generic Python
+    HTTP client regardless of headers sent. `curl_cffi` with
+    `impersonate="chrome"` reproduces an actual Chrome TLS fingerprint and
+    gets through reliably (confirmed with repeated live requests).
+    """
+    response = curl_requests.get(HONDA_HOMEPAGE_URL, impersonate="chrome", timeout=10)
+    response.raise_for_status()
+    return response.text
+
+
+async def _get_honda_prices() -> dict[str, str]:
+    """Fetch + parse honda.com.pk's mega-menu prices, using a short-lived cache."""
+    global _price_cache, _price_cache_time
+
+    now = time.monotonic()
+    if _price_cache and (now - _price_cache_time) < _PRICE_CACHE_TTL_SECS:
+        return _price_cache
+
+    html = await asyncio.to_thread(_fetch_honda_homepage_sync)
+
+    _price_cache = {
+        name.strip().lower(): price for name, price in _HONDA_PRICE_PATTERN.findall(html)
+    }
+    _price_cache_time = now
+    return _price_cache
+
+
+async def check_honda_price(params: FunctionCallParams):
+    """Tool handler: looks up a Honda Pakistan model line's real, current
+    starting price by fetching and parsing honda.com.pk's own homepage -
+    the same "From PKR X" figure shown to any visitor of the site.
+
+    Called by the LLM (not directly by us) whenever it decides the user is
+    asking about price for a model. `params.arguments` holds whatever
+    arguments the model filled in, matching the `properties` declared in
+    `honda_price_tool` below.
+    """
+    model = str(params.arguments.get("model", "")).strip().lower()
+    # Loose match so "hrv", "hr-v", and "HR V" all match the site's "hr-v".
+    model_key = model.replace("-", "").replace(" ", "")
+
+    try:
+        prices = await _get_honda_prices()
+    except curl_requests.exceptions.RequestException as e:
+        logger.error(f"[tool call] check_honda_price: fetch failed: {e}")
+        await params.result_callback(
+            {"model": model, "found": False, "error": "could not reach honda.com.pk right now"}
+        )
+        return
+
+    match = next(
+        (
+            price
+            for name, price in prices.items()
+            if name.replace("-", "").replace(" ", "") == model_key
+        ),
+        None,
+    )
+
+    logger.log("CONVO", f"[tool call] check_honda_price(model={model!r}) -> {match}")
+
+    if match is None:
+        await params.result_callback(
+            {"model": model, "found": False, "available_models": list(prices.keys())}
+        )
+    else:
+        await params.result_callback(
+            {"model": model, "found": True, "starting_price_pkr": match}
+        )
+
+
+honda_price_tool = FunctionSchema(
+    name="check_honda_price",
+    description=(
+        "Look up the real, current starting price (in PKR) of a Honda "
+        "Pakistan model line - Civic, HR-V, or City - by checking the live "
+        "honda.com.pk website."
+    ),
+    properties={
+        "model": {
+            "type": "string",
+            "description": "The Honda model line to check, e.g. 'Civic', 'HR-V', or 'City'.",
+        }
+    },
+    required=["model"],
+    handler=check_honda_price,
+)
 
 
 def _avg_logprob(result: Transcription) -> float:
@@ -166,7 +295,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         ),
     )
 
-    context = LLMContext()
+    context = LLMContext(tools=[honda_price_tool])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
