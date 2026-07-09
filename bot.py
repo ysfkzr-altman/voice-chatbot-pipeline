@@ -1,17 +1,19 @@
 """
-Rudimentary voice AI chatbot pipeline. Runs either over WebRTC in the browser
-or directly against the local mic/speakers from the CLI.
+Rudimentary voice AI chatbot pipeline - text-output variant. Runs either over
+WebRTC in the browser or directly against the local mic from the CLI. Input
+is still spoken (mic), but the bot's reply is text-only: no TTS, no speaker
+output. Over WebRTC/eval, the reply is delivered to the connected client as
+an RTVI "bot-llm-text" message; in --local mode it's only visible in the
+console (CONVO log line), since there's no client to receive a text message.
 
 Pipeline: mic (WebRTC or local) -> Silero VAD -> Groq STT (Whisper)
-          -> Groq LLM (Llama 3.3 70B) -> Kokoro TTS (local, no API key) -> speakers
+          -> Groq LLM (Llama 3.3 70B) -> text delivered via RTVI (no TTS)
 
 Run:
     python bot.py             # WebRTC server; open http://localhost:7860
-    python bot.py --local     # Talk directly via the local mic/speakers
+    python bot.py --local     # Talk directly via the local mic (reply is console-only)
 
 Requires GROQ_API_KEY in a .env file.
-Kokoro model files (~87 MB) are downloaded automatically on first run to
-~/.cache/pipecat/kokoro-onnx/.
 """
 
 import asyncio
@@ -24,7 +26,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
+from pipecat.frames.frames import ErrorFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -32,9 +34,9 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.frameworks.rtvi.models import BotLLMTextMessage, TextMessageData
 from pipecat.runner.types import EvalRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.whisper.base_stt import Transcription
@@ -62,9 +64,9 @@ logger.level("CONVO", no=25, color="<green>", icon="")
 logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "DEBUG"))
 
 SYSTEM_INSTRUCTION = (
-    "You are a helpful assistant in a voice conversation. Your responses will "
-    "be spoken aloud, so avoid emojis, bullet points, or other formatting that "
-    "can't be spoken. "
+    "You are a helpful assistant. The user is speaking to you out loud, but "
+    "your replies are delivered back as text, not spoken - so normal written "
+    "formatting is fine. "
     "You understand all languages. Always respond in English regardless of what language the user speaks in. "
     "Keep every response short and direct — one or two "
     "sentences by default, never more than a few. No filler, no preamble, no "
@@ -75,8 +77,6 @@ SYSTEM_INSTRUCTION = (
 GREETING_MESSAGE = "Hi! How can I help you today?"
 FALLBACK_ERROR_MESSAGE = "Sorry, I hit a glitch there. Could you say that again?"
 FALLBACK_COOLDOWN_SECS = 5.0
-
-KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 
 
 def _avg_logprob(result: Transcription) -> float:
@@ -112,11 +112,11 @@ class BilingualGroqSTTService(GroqSTTService):
     slower of the two, not the sum - but token/request usage is 2x.
 
     NOTE: The LLM is instructed (system prompt) to always reply in English
-    regardless of input language, because the TTS side (KokoroTTSService)
-    does not support Urdu script and will error on it. This means the bot
-    understands both languages but only speaks English. To make it speak
-    Urdu too, swap KokoroTTSService for Google Cloud TTS (ur-IN) or Azure
-    TTS (ur-PK), both of which have Urdu voices.
+    regardless of input language. This was originally required because the
+    audio-output version's TTS (KokoroTTSService) can't speak Urdu script -
+    that constraint doesn't actually apply to this text-output variant (any
+    script can be displayed as text), but the English-only instruction was
+    kept as-is here to keep behavior consistent between the two variants.
     """
 
     async def _transcribe(self, audio: bytes) -> Transcription:
@@ -155,18 +155,13 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         settings=GroqSTTService.Settings(model="whisper-large-v3"),
     )
 
-    tts = KokoroTTSService(
-        settings=KokoroTTSService.Settings(voice=KOKORO_VOICE),
-    )
-
     llm = GroqLLMService(
         api_key=os.environ["GROQ_API_KEY"],
         settings=GroqLLMService.Settings(
             model="llama-3.3-70b-versatile",
             system_instruction=SYSTEM_INSTRUCTION,
             # Hard cap backing up the "keep it short" system prompt instruction -
-            # bounds worst-case LLM generation time and TTS synthesis time, and
-            # keeps sentences well under Kokoro's ~510-phoneme truncation limit.
+            # bounds worst-case LLM generation time.
             max_completion_tokens=150,
         ),
     )
@@ -190,9 +185,8 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             transport.input(),  # Mic input
             stt,  # Speech -> text
             user_aggregator,  # Collect user turn
-            llm,  # Generate response
-            tts,  # Text -> speech
-            transport.output(),  # Speaker output
+            llm,  # Generate response (text delivered to the client via RTVI below)
+            transport.output(),  # Delivers RTVI text messages to the client - no TTS/audio
             assistant_aggregator,  # Collect assistant turn
         ]
     )
@@ -203,6 +197,9 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        # enable_rtvi defaults to True - this is what turns the LLM's
+        # streamed text into "bot-llm-text" messages sent to the client,
+        # replacing what TTS used to do.
     )
 
     last_fallback_speak_time = 0.0
@@ -214,36 +211,35 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         if frame.fatal:
             return
 
-        # If TTS itself is the thing failing, speaking a fallback apology
-        # through that same broken TTS just triggers another ErrorFrame,
-        # which re-triggers this handler - an infinite retry loop hammering
-        # the TTS API. Log only; there's no way to speak our way out of a
-        # dead TTS connection.
-        if frame.processor is tts:
-            logger.error("TTS itself is failing - not attempting a spoken fallback (would loop).")
-            return
-
-        # General safety net: never fire the spoken fallback more than once
-        # every FALLBACK_COOLDOWN_SECS, regardless of source, in case some
-        # other repeat-failure pattern (e.g. STT down on every turn) shows up.
+        # General safety net: never fire the fallback more than once every
+        # FALLBACK_COOLDOWN_SECS, regardless of source (e.g. STT down on
+        # every turn).
         now = time.monotonic()
         if now - last_fallback_speak_time < FALLBACK_COOLDOWN_SECS:
             return
         last_fallback_speak_time = now
 
-        # A non-fatal ErrorFrame (STT/LLM/TTS hiccup, rate limit, etc.) would
-        # otherwise just get logged, leaving the user hearing silence for
-        # that turn. Speak a short apology instead so the conversation can
-        # continue. append_to_context=False keeps it out of the LLM history.
-        await worker.queue_frames(
-            [TTSSpeakFrame(text=FALLBACK_ERROR_MESSAGE, append_to_context=False)]
+        # A non-fatal ErrorFrame (STT/LLM hiccup, rate limit, etc.) would
+        # otherwise just get logged, leaving the user with no reply for that
+        # turn. Send a short apology as a text message instead, so the
+        # conversation can continue. Not added to LLM context, matching the
+        # original TTS-based fallback's behavior.
+        logger.log("CONVO", f"Bot: {FALLBACK_ERROR_MESSAGE}")
+        await worker.rtvi.push_transport_message(
+            BotLLMTextMessage(data=TextMessageData(text=FALLBACK_ERROR_MESSAGE))
         )
 
-    # Speak a fixed greeting directly instead of round-tripping through the LLM
-    # just to say hello - saves an API call and the greeting is heard sooner.
-    # append_to_context defaults to True, so it's still recorded in history for
-    # any follow-up that references it.
-    await worker.queue_frames([TTSSpeakFrame(text=GREETING_MESSAGE)])
+    @worker.event_handler("on_pipeline_started")
+    async def send_greeting(worker, frame):
+        # Sent directly as a text message instead of round-tripping through
+        # the LLM just to say hello - saves an API call. Unlike the original
+        # TTS-based greeting, this isn't added to the LLM's conversation
+        # history (RTVI text pushes don't touch LLMContext) - a minor,
+        # accepted trade-off of the text-output variant.
+        logger.log("CONVO", f"Bot: {GREETING_MESSAGE}")
+        await worker.rtvi.push_transport_message(
+            BotLLMTextMessage(data=TextMessageData(text=GREETING_MESSAGE))
+        )
 
     runner = WorkerRunner(handle_sigint=handle_sigint)
     await runner.add_workers(worker)
@@ -262,7 +258,7 @@ async def bot(runner_args: RunnerArguments):
             webrtc_connection=runner_args.webrtc_connection,
             params=TransportParams(
                 audio_in_enabled=True,
-                audio_out_enabled=True,
+                audio_out_enabled=False,  # no TTS - replies go out as RTVI text messages
             ),
         )
     elif isinstance(runner_args, EvalRunnerArguments):
@@ -270,7 +266,7 @@ async def bot(runner_args: RunnerArguments):
 
         transport = await create_transport(
             runner_args,
-            {"eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=True)},
+            {"eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=False)},
         )
     else:
         raise RuntimeError(
@@ -313,7 +309,7 @@ async def run_local():
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
-            audio_out_enabled=True,
+            audio_out_enabled=False,  # no TTS - reply only appears in the console (CONVO log)
             input_device_index=_find_headset_mic_device_index(),
         )
     )
