@@ -1,0 +1,34 @@
+name: tool_calling_test
+
+# Verifies the check_inventory tool-calling demo actually gets invoked and
+# the reply reflects the real (fake) inventory data, not a guess.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/tool_calling_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Do you have a Civic in stock?"
+    expect:
+      - event: function_call
+        name: check_inventory
+        within_ms: 10000
+      - event: llm_response
+        text_contains: "3"
+        within_ms: 15000
+
+  - user: "What about the Accord?"
+    expect:
+      - event: function_call
+        name: check_inventory
+        within_ms: 10000
+      - event: llm_response
+        eval: "Does the response say the Accord is out of stock, unavailable, or has zero units?"
+        within_ms: 15000

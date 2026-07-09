@@ -5,6 +5,12 @@ or directly against the local mic/speakers from the CLI.
 Pipeline: mic (WebRTC or local) -> Silero VAD -> Groq STT (Whisper)
           -> Groq LLM (Llama 3.3 70B) -> Kokoro TTS (local, no API key) -> speakers
 
+This branch adds one worked example of LLM tool calling: a fake dealership
+`check_inventory` tool (see INVENTORY / check_inventory below), so the bot
+can answer "do you have a Civic in stock?" from real(ish) data instead of
+just chatting generically. Swap the fake dict + lookup for a real API/DB
+call to point this at an actual business's data.
+
 Run:
     python bot.py             # WebRTC server; open http://localhost:7860
     python bot.py --local     # Talk directly via the local mic/speakers
@@ -23,6 +29,7 @@ import pyaudio
 from dotenv import load_dotenv
 from loguru import logger
 
+from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -37,6 +44,7 @@ from pipecat.runner.utils import create_transport
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.whisper.base_stt import Transcription
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
@@ -62,14 +70,16 @@ logger.level("CONVO", no=25, color="<green>", icon="")
 logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "DEBUG"))
 
 SYSTEM_INSTRUCTION = (
-    "You are a helpful assistant in a voice conversation. Your responses will "
-    "be spoken aloud, so avoid emojis, bullet points, or other formatting that "
-    "can't be spoken. "
+    "You are a helpful assistant for a car dealership, in a voice conversation. "
+    "Your responses will be spoken aloud, so avoid emojis, bullet points, or "
+    "other formatting that can't be spoken. "
     "You understand all languages. Always respond in English regardless of what language the user speaks in. "
     "Keep every response short and direct — one or two "
     "sentences by default, never more than a few. No filler, no preamble, no "
     "restating the question, no hedging caveats. Answer exactly what was asked "
-    "and stop."
+    "and stop. "
+    "If the user asks whether a specific car model is in stock, use the "
+    "check_inventory tool rather than guessing - never make up stock numbers."
 )
 
 GREETING_MESSAGE = "Hi! How can I help you today?"
@@ -77,6 +87,57 @@ FALLBACK_ERROR_MESSAGE = "Sorry, I hit a glitch there. Could you say that again?
 FALLBACK_COOLDOWN_SECS = 5.0
 
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+
+# Worked example of tool calling: a fake dealership inventory. In a real
+# integration, check_inventory would call that business's actual
+# inventory API/DB instead of reading this hardcoded dict.
+INVENTORY = {
+    "civic": 3,
+    "accord": 0,
+    "cr-v": 5,
+    "mg zs": 2,
+    "mg hs": 0,
+}
+
+
+async def check_inventory(params: FunctionCallParams):
+    """Tool handler: looks up how many units of a car model are in stock.
+
+    Called by the LLM (not directly by us) whenever it decides the user is
+    asking about stock for a specific model. `params.arguments` holds
+    whatever arguments the model filled in, matching the `properties`
+    declared in `inventory_tool` below.
+    """
+    model = str(params.arguments.get("model", "")).strip().lower()
+    count = INVENTORY.get(model)
+
+    logger.log("CONVO", f"[tool call] check_inventory(model={model!r}) -> {count}")
+
+    if count is None:
+        result = {"model": model, "found": False}
+    else:
+        result = {"model": model, "found": True, "in_stock": count > 0, "count": count}
+
+    # Hands the result back to the LLM, which then generates the spoken
+    # reply using it - the tool call never speaks directly.
+    await params.result_callback(result)
+
+
+inventory_tool = FunctionSchema(
+    name="check_inventory",
+    description=(
+        "Check how many units of a specific car model are currently in "
+        "stock at the dealership."
+    ),
+    properties={
+        "model": {
+            "type": "string",
+            "description": "The car model to check, e.g. 'Civic' or 'MG ZS'.",
+        }
+    },
+    required=["model"],
+    handler=check_inventory,
+)
 
 
 def _avg_logprob(result: Transcription) -> float:
@@ -171,7 +232,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         ),
     )
 
-    context = LLMContext()
+    context = LLMContext(tools=[inventory_tool])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
