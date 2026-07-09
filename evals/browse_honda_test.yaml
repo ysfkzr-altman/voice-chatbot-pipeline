@@ -1,0 +1,26 @@
+name: browse_honda_test
+
+# Verifies the general-purpose browse_honda_page tool - checks the bot can
+# answer questions beyond price (contact info, dealer locations) by
+# actually fetching real content from honda.com.pk.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/browse_honda_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "What's Honda Pakistan's contact phone number?"
+    expect:
+      - event: function_call
+        name: browse_honda_page
+        within_ms: 10000
+      - event: llm_response
+        text_contains: "111"
+        within_ms: 15000

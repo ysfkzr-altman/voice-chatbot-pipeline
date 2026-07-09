@@ -9,10 +9,14 @@ console (CONVO log line), since there's no client to receive a text message.
 Pipeline: mic (WebRTC or local) -> Silero VAD -> Groq STT (Whisper)
           -> Groq LLM (Llama 3.3 70B) -> text delivered via RTVI (no TTS)
 
-Also includes a worked example of LLM tool calling: `check_honda_price`
-fetches and parses the real, live starting prices from honda.com.pk's own
-homepage (see check_honda_price below), so the bot can answer "how much is
-the Civic?" using actual current data instead of a guess.
+Also includes worked examples of LLM tool calling against a REAL website
+(honda.com.pk), not fake/hardcoded data:
+  - check_honda_price: real, live starting prices from the homepage's
+    mega-menu.
+  - browse_honda_page: fetches and reads any of a known set of real pages
+    on the site (model specs/features, dealer contact info, promotions,
+    company info, policies) so the bot can answer open-ended questions
+    about the site's actual content, not just price.
 
 Run:
     python bot.py             # WebRTC server; open http://localhost:7860
@@ -28,6 +32,7 @@ import sys
 import time
 
 import pyaudio
+from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
 from dotenv import load_dotenv
 from loguru import logger
@@ -82,7 +87,10 @@ SYSTEM_INSTRUCTION = (
     "restating the question, no hedging caveats. Answer exactly what was asked "
     "and stop. "
     "If the user asks about the price of a Honda Civic, HR-V, or City, use "
-    "the check_honda_price tool rather than guessing - never make up a price."
+    "the check_honda_price tool rather than guessing - never make up a price. "
+    "For anything else about Honda Pakistan - specs, features, dealers, "
+    "contact info, promotions, company info, policies - use the "
+    "browse_honda_page tool to check the real website rather than guessing."
 )
 
 GREETING_MESSAGE = "Hi! How can I help you today?"
@@ -207,6 +215,153 @@ honda_price_tool = FunctionSchema(
     handler=check_honda_price,
 )
 
+# General-purpose "browse the real website" tool - covers everything on
+# honda.com.pk that ISN'T the price mega-menu: model specs/features,
+# dealer/contact info, promotions, company info, policies. Maps a handful
+# of friendly topic names to the real page slugs discovered by actually
+# crawling the site's homepage links (not guessed).
+HONDA_PAGE_SLUGS = {
+    "civic": "civic-standard",
+    "civic standard": "civic-standard",
+    "civic oriel": "civic-oriel-1-5",
+    "civic rs": "civic-rs-turbo",
+    "civic rs turbo": "civic-rs-turbo",
+    "hr-v": "hrv-vti",
+    "hrv": "hrv-vti",
+    "hr-v s": "hrv-vti-s",
+    "hr-v hybrid": "hrv-ehev",
+    "hrv hybrid": "hrv-ehev",
+    "hrv e:hev": "hrv-ehev",
+    "city": "city1-2l",
+    "city 1.2": "city1-2l",
+    "city 1.5": "city1-5l",
+    "city aspire": "cityaspire",
+    "accord": "hondaaccord",
+    "cr-v": "hondacrv",
+    "crv": "hondacrv",
+    "about": "abouthonda",
+    "about honda": "abouthonda",
+    "company": "abouthonda",
+    "contact": "contactus",
+    "contact us": "contactus",
+    "dealer": "location-us",
+    "dealers": "location-us",
+    "dealer network": "location-us",
+    "locations": "location-us",
+    "promotions": "promotions",
+    "offers": "promotions",
+    "deals": "promotions",
+    "news": "newsandevents",
+    "events": "newsandevents",
+    "free service": "free-service",
+    "delivery status": "delivery-status",
+    "policies": "policies",
+    "privacy policy": "privacy-policy",
+    "terms": "terms-and-conditions",
+    "terms and conditions": "terms-and-conditions",
+}
+
+# Cache extracted page text briefly, per slug - same politeness rationale
+# as the price cache above.
+_page_text_cache: dict[str, str] = {}
+_page_text_cache_time: dict[str, float] = {}
+_PAGE_CACHE_TTL_SECS = 300.0
+_PAGE_TEXT_MAX_CHARS = 3000
+
+
+def _fetch_and_extract_page_sync(slug: str) -> str:
+    """Blocking fetch + HTML-to-text extraction, run in a background thread.
+
+    Uses the same curl_cffi Chrome-impersonation approach as
+    `_fetch_honda_homepage_sync` (see that docstring for why) since this
+    hits the same Cloudflare-protected site. Strips script/style/nav/footer
+    noise and returns plain, readable text for the LLM to read - real page
+    content, not a summary or paraphrase we wrote ourselves.
+    """
+    url = f"https://www.honda.com.pk/{slug}"
+    response = curl_requests.get(url, impersonate="chrome", timeout=10)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "noscript", "svg"]):
+        tag.decompose()
+    text = " ".join(soup.get_text(separator=" ", strip=True).split())
+    return text[:_PAGE_TEXT_MAX_CHARS]
+
+
+async def browse_honda_page(params: FunctionCallParams):
+    """Tool handler: fetches and reads a real page on honda.com.pk.
+
+    Called by the LLM whenever it decides the user is asking about
+    something on the site other than price - specs, features, dealer
+    info, promotions, company info, policies. `params.arguments["topic"]`
+    is matched (loosely) against `HONDA_PAGE_SLUGS` to find the real page.
+    """
+    topic = str(params.arguments.get("topic", "")).strip().lower()
+    slug = HONDA_PAGE_SLUGS.get(topic)
+
+    if slug is None:
+        # Loose fallback: does any known topic phrase appear in what the
+        # model sent, or vice versa? Handles near-misses like "civics" or
+        # "the hrv model" without needing an exact dict key match.
+        slug = next(
+            (s for key, s in HONDA_PAGE_SLUGS.items() if key in topic or topic in key),
+            None,
+        )
+
+    if slug is None:
+        logger.log("CONVO", f"[tool call] browse_honda_page(topic={topic!r}) -> no match")
+        await params.result_callback(
+            {
+                "topic": topic,
+                "found": False,
+                "available_topics": sorted(set(HONDA_PAGE_SLUGS.keys())),
+            }
+        )
+        return
+
+    now = time.monotonic()
+    cached = _page_text_cache.get(slug)
+    if cached is not None and (now - _page_text_cache_time.get(slug, 0)) < _PAGE_CACHE_TTL_SECS:
+        text = cached
+    else:
+        try:
+            text = await asyncio.to_thread(_fetch_and_extract_page_sync, slug)
+        except curl_requests.exceptions.RequestException as e:
+            logger.error(f"[tool call] browse_honda_page: fetch failed for {slug!r}: {e}")
+            await params.result_callback(
+                {"topic": topic, "found": False, "error": "could not reach honda.com.pk right now"}
+            )
+            return
+        _page_text_cache[slug] = text
+        _page_text_cache_time[slug] = now
+
+    logger.log(
+        "CONVO", f"[tool call] browse_honda_page(topic={topic!r}) -> {slug} ({len(text)} chars)"
+    )
+    await params.result_callback({"topic": topic, "found": True, "page_content": text})
+
+
+browse_honda_page_tool = FunctionSchema(
+    name="browse_honda_page",
+    description=(
+        "Fetch and read a real page from the honda.com.pk website to answer "
+        "questions about model specs/features, dealer or contact info, "
+        "promotions, company info, or policies - anything other than price."
+    ),
+    properties={
+        "topic": {
+            "type": "string",
+            "description": (
+                "What to look up, e.g. 'Civic specs', 'dealer locations', "
+                "'contact info', 'promotions', 'about honda'."
+            ),
+        }
+    },
+    required=["topic"],
+    handler=browse_honda_page,
+)
+
 
 def _avg_logprob(result: Transcription) -> float:
     """Mean segment log-probability, used as a confidence proxy.
@@ -295,7 +450,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         ),
     )
 
-    context = LLMContext(tools=[honda_price_tool])
+    context = LLMContext(tools=[honda_price_tool, browse_honda_page_tool])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
