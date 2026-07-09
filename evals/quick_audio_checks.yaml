@@ -1,0 +1,45 @@
+name: quick_audio_checks
+
+# Automated checks for two more audio edge cases: very short utterances,
+# and talking again shortly after the bot finishes (inside the 5-second
+# user_turn_stop_timeout window). Synthesized user speech via Kokoro, no
+# human required.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/quick_audio_checks.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  # NOTE: bot.py fires its greeting immediately on pipeline start, not gated
+  # on a client connecting, so in eval mode it happens before the harness
+  # even connects - no point asserting on it here.
+
+  # Very short utterance - tests whether a single short word survives
+  # Whisper's stop_secs=0.2 silence-cutoff without getting truncated.
+  - user: "Yes"
+    expect:
+      - event: user_transcription
+        within_ms: 6000
+      - event: llm_response
+        within_ms: 10000
+
+  # Talk again immediately (within ~1s) after the bot finishes replying -
+  # well inside the 5-second user_turn_stop_timeout window. Tests whether
+  # the second utterance gets accepted, dropped, or merged.
+  - user: "What is three plus three?"
+    send_after:
+      event: llm_response
+      delay_ms: 1000
+    expect:
+      # No text_contains: Whisper legitimately transcribes spoken numbers as
+      # digits ("3" not "three") - just confirming the turn was picked up
+      # at all is the point of this test.
+      - event: user_transcription
+        within_ms: 6000

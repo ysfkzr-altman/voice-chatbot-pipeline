@@ -14,6 +14,7 @@ Kokoro model files (~87 MB) are downloaded automatically on first run to
 ~/.cache/pipecat/kokoro-onnx/.
 """
 
+import asyncio
 import os
 import sys
 import time
@@ -23,7 +24,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame, LLMRunFrame, TTSSpeakFrame
+from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -31,7 +32,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
+from pipecat.runner.types import EvalRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
+from pipecat.runner.utils import create_transport
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
@@ -55,7 +57,9 @@ logger.remove(0)
 # what the bot said) - separate from DEBUG/INFO noise. Must be registered
 # before any sink references it by name.
 logger.level("CONVO", no=25, color="<green>", icon="")
-logger.add(sys.stderr, level="CONVO")
+# Set LOG_LEVEL=DEBUG in the environment to also see per-turn diagnostics
+# (e.g. the raw STT transcript logged in UrduGroqSTTService._transcribe).
+logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "DEBUG"))
 
 SYSTEM_INSTRUCTION = (
     "You are a helpful assistant in a voice conversation. Your responses will "
@@ -68,48 +72,85 @@ SYSTEM_INSTRUCTION = (
     "and stop."
 )
 
+GREETING_MESSAGE = "Hi! How can I help you today?"
 FALLBACK_ERROR_MESSAGE = "Sorry, I hit a glitch there. Could you say that again?"
 FALLBACK_COOLDOWN_SECS = 5.0
 
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 
 
-class MultilingualGroqSTTService(GroqSTTService):
-    """GroqSTTService with Whisper language auto-detection enabled.
+def _avg_logprob(result: Transcription) -> float:
+    """Mean segment log-probability, used as a confidence proxy.
 
-    The upstream service hardcodes `language=EN` and always sends it to the
-    API, which causes Whisper to force-fit every utterance into English
-    phonemes.  Omitting the language parameter entirely tells Whisper to
-    detect the language from the audio — works for Urdu, English, and
-    code-switched input without any extra configuration.
+    Whisper doesn't expose a single "confidence" number, but each segment's
+    avg_logprob (closer to 0 = more confident) is the standard stand-in.
+    Returns -inf for silent/empty audio (no segments) so it always loses to
+    a real transcript when comparing two candidates.
+    """
+    segments = getattr(result, "segments", None) or []
+    if not segments:
+        return float("-inf")
+    return sum(getattr(s, "avg_logprob", 0.0) for s in segments) / len(segments)
 
-    NOTE: The TTS side (KokoroTTSService) does not support Urdu, so the bot
-    can understand Urdu input and the LLM will reply in Urdu, but the spoken
-    output will be garbled or silent for Urdu text.  Fix: swap KokoroTTSService
-    for Google Cloud TTS (ur-IN) or Azure TTS (ur-PK) when Urdu voice output
-    is needed.
+
+class BilingualGroqSTTService(GroqSTTService):
+    """GroqSTTService constrained to a closed set of two languages: English and Urdu.
+
+    Whisper's own language auto-detection was tried and misdetected short
+    Urdu clips as Chinese - it's unconstrained across every language Whisper
+    knows, which is overkill and unreliable for a bot that only ever needs
+    to distinguish two specific languages.
+
+    Instead, each utterance is transcribed twice concurrently - once forced
+    to `language="en"`, once forced to `language="ur"` - and whichever
+    result has the higher average segment confidence (avg_logprob) wins.
+    Forcing removes the third-language misdetection failure mode entirely,
+    since Whisper is never given the option to guess anything else.
+
+    Trade-off: this doubles Groq STT API calls per turn. Both calls run
+    concurrently via asyncio.gather, so wall-clock latency is roughly the
+    slower of the two, not the sum - but token/request usage is 2x.
+
+    NOTE: The LLM is instructed (system prompt) to always reply in English
+    regardless of input language, because the TTS side (KokoroTTSService)
+    does not support Urdu script and will error on it. This means the bot
+    understands both languages but only speaks English. To make it speak
+    Urdu too, swap KokoroTTSService for Google Cloud TTS (ur-IN) or Azure
+    TTS (ur-PK), both of which have Urdu voices.
     """
 
     async def _transcribe(self, audio: bytes) -> Transcription:
-        kwargs = {
+        base_kwargs = {
             "file": ("audio.wav", audio, "audio/wav"),
             "model": self._settings.model,
-            "response_format": "verbose_json" if self._include_prob_metrics else "json",
-            "language": "ur",
+            "response_format": "verbose_json",
         }
         if self._settings.prompt is not None:
-            kwargs["prompt"] = self._settings.prompt
+            base_kwargs["prompt"] = self._settings.prompt
         if self._settings.temperature is not None:
-            kwargs["temperature"] = self._settings.temperature
-        result = await self._client.audio.transcriptions.create(**kwargs)
+            base_kwargs["temperature"] = self._settings.temperature
+
+        result_en, result_ur = await asyncio.gather(
+            self._client.audio.transcriptions.create(language="en", **base_kwargs),
+            self._client.audio.transcriptions.create(language="ur", **base_kwargs),
+        )
+
+        conf_en, conf_ur = _avg_logprob(result_en), _avg_logprob(result_ur)
+        winner, lang, conf = (
+            (result_en, "en", conf_en) if conf_en >= conf_ur else (result_ur, "ur", conf_ur)
+        )
+
         # repr() is ASCII-safe: shows \uXXXX escapes for non-Latin chars so
         # you can tell whether Whisper returned actual Urdu Unicode or English.
-        logger.debug(f"STT raw transcript: {repr(result.text)}")
-        return result
+        logger.debug(
+            f"STT bilingual pick: lang={lang} conf={conf:.3f} "
+            f"(en={conf_en:.3f} ur={conf_ur:.3f}) text={repr(winner.text)}"
+        )
+        return winner
 
 
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
-    stt = MultilingualGroqSTTService(
+    stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
         settings=GroqSTTService.Settings(model="whisper-large-v3"),
     )
@@ -123,6 +164,10 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         settings=GroqLLMService.Settings(
             model="llama-3.3-70b-versatile",
             system_instruction=SYSTEM_INSTRUCTION,
+            # Hard cap backing up the "keep it short" system prompt instruction -
+            # bounds worst-case LLM generation time and TTS synthesis time, and
+            # keeps sentences well under Kokoro's ~510-phoneme truncation limit.
+            max_completion_tokens=150,
         ),
     )
 
@@ -194,8 +239,11 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             [TTSSpeakFrame(text=FALLBACK_ERROR_MESSAGE, append_to_context=False)]
         )
 
-    context.add_message({"role": "developer", "content": "Please introduce yourself to the user."})
-    await worker.queue_frames([LLMRunFrame()])
+    # Speak a fixed greeting directly instead of round-tripping through the LLM
+    # just to say hello - saves an API call and the greeting is heard sooner.
+    # append_to_context defaults to True, so it's still recorded in history for
+    # any follow-up that references it.
+    await worker.queue_frames([TTSSpeakFrame(text=GREETING_MESSAGE)])
 
     runner = WorkerRunner(handle_sigint=handle_sigint)
     await runner.add_workers(worker)
@@ -203,21 +251,31 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
 
 
 async def bot(runner_args: RunnerArguments):
-    """Entry point used by the WebRTC dev runner (``python bot.py -t webrtc``)."""
-    if not isinstance(runner_args, SmallWebRTCRunnerArguments):
-        raise RuntimeError("This bot only supports the WebRTC transport (run with -t webrtc).")
+    """Entry point used by the WebRTC dev runner (``python bot.py -t webrtc``)
+    and the eval harness (``python bot.py -t eval``)."""
+    if isinstance(runner_args, SmallWebRTCRunnerArguments):
+        # Imported here (not at module level) so `--local` mode never pays the
+        # aiortc import cost - it doesn't use this transport at all.
+        from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
-    # Imported here (not at module level) so `--local` mode never pays the
-    # aiortc import cost - it doesn't use this transport at all.
-    from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+        transport = SmallWebRTCTransport(
+            webrtc_connection=runner_args.webrtc_connection,
+            params=TransportParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+            ),
+        )
+    elif isinstance(runner_args, EvalRunnerArguments):
+        from pipecat.evals.transport import EvalTransportParams
 
-    transport = SmallWebRTCTransport(
-        webrtc_connection=runner_args.webrtc_connection,
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-        ),
-    )
+        transport = await create_transport(
+            runner_args,
+            {"eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=True)},
+        )
+    else:
+        raise RuntimeError(
+            "This bot only supports the WebRTC transport (-t webrtc) or eval transport (-t eval)."
+        )
 
     await run_bot(transport, handle_sigint=runner_args.handle_sigint)
 
@@ -244,7 +302,7 @@ def _find_headset_mic_device_index() -> int | None:
             ):
                 return i
     except OSError:
-        pass  # WASAPI not available on this system
+        pass  # DirectSound host API not available on this system
     finally:
         pa.terminate()
     return None

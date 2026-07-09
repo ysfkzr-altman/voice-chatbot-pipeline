@@ -1,0 +1,35 @@
+name: stt_failure_test
+
+# Tests the fallback-apology path when speech-to-text itself is broken (bad
+# GROQ_API_KEY). Requires starting the bot process with a bad key - see the
+# run instructions below. Kokoro TTS needs no API key, so the fallback
+# apology should still be audibly spoken even though STT/LLM are both down
+# (they share GROQ_API_KEY). Uses an audio judge (moonshine, local, no API
+# key) to verify the actual synthesized apology text, not just that some
+# event fired.
+#
+# Run (two terminals):
+#   set GROQ_API_KEY=bad_key_for_testing
+#   python bot.py -t eval
+#
+#   (separate terminal, real key not needed for the eval client itself)
+#   pipecat eval run evals/stt_failure_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+judge:
+  modality: audio
+  transcription:
+    service: moonshine
+
+turns:
+  - user: "Hello, are you there?"
+    expect:
+      - event: tts_response
+        text_contains: "glitch"
+        within_ms: 15000

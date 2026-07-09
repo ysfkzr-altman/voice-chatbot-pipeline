@@ -1,0 +1,41 @@
+name: bargein_test
+
+# Automated barge-in / interruption test. The "user" side is synthesized
+# speech (Kokoro, local, no API key), sent through the bot's real mic path
+# (VAD + STT), so this exercises the actual interruption-detection code -
+# no human speaking required.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/bargein_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  # NOTE: bot.py fires its greeting immediately on pipeline start, not gated
+  # on a client connecting, so in eval mode it happens before the harness
+  # even connects - no point asserting on it here.
+
+  # Ask something that should produce a longer response, giving a real
+  # window to interrupt into.
+  - user: "Can you describe the water cycle in a few sentences?"
+    expect:
+      - event: llm_started
+        within_ms: 8000
+
+  # Interrupt 700ms after the bot starts responding - still very likely
+  # mid-generation or mid-speech. If VAD correctly detects speech during
+  # bot playback, user_started_speaking should fire quickly after this
+  # synthesized utterance starts.
+  - user: "Wait, stop, never mind."
+    send_after:
+      event: llm_started
+      delay_ms: 700
+    expect:
+      - event: user_started_speaking
+        within_ms: 4000

@@ -1,0 +1,37 @@
+name: backchannel_test
+
+# Tests whether a short listener acknowledgment ("mm-hmm") while the bot is
+# talking gets wrongly treated as a real interruption/turn, instead of being
+# ignored as backchanneling. Synthesized via Kokoro, no human needed.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/backchannel_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Can you describe the water cycle in a few sentences?"
+    expect:
+      - event: llm_started
+        within_ms: 8000
+
+  # A short backchannel sound 900ms into the bot's response - not meant as
+  # an interruption, just listener feedback. There's no minimum-duration or
+  # confidence guard in the current VAD/interruption setup specifically for
+  # this, so this is expected to register as a full turn (getting picked up
+  # by VAD and transcribed) rather than being filtered out as a backchannel.
+  - user: "Mm-hmm"
+    send_after:
+      event: llm_started
+      delay_ms: 900
+    expect:
+      - event: user_started_speaking
+        within_ms: 4000
+      - event: user_transcription
+        within_ms: 6000

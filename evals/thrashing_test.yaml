@@ -1,0 +1,65 @@
+name: thrashing_test
+
+# Tests what happens when the bot gets interrupted repeatedly in quick
+# succession, before it ever finishes a sentence. Checks whether the
+# pipeline still recovers and answers a clean final question correctly, or
+# whether the conversation context/state gets corrupted. Synthesized via
+# Kokoro, no human needed.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/thrashing_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Can you explain how airplanes fly, in detail?"
+    expect:
+      - event: llm_started
+        within_ms: 8000
+
+  # First interruption, 500ms into the response.
+  - user: "Wait"
+    send_after:
+      event: llm_started
+      delay_ms: 500
+    expect:
+      - event: user_started_speaking
+        within_ms: 4000
+
+  # Second interruption, 600ms after the first one registered - the bot
+  # likely hasn't finished responding to "Wait" yet either.
+  - user: "Actually hold on"
+    send_after:
+      event: user_started_speaking
+      delay_ms: 600
+    expect:
+      - event: user_started_speaking
+        within_ms: 4000
+
+  # Third interruption, same pattern.
+  - user: "One more second"
+    send_after:
+      event: user_started_speaking
+      delay_ms: 600
+    expect:
+      - event: user_started_speaking
+        within_ms: 4000
+
+  # After three rapid interruptions, ask something clean and check whether
+  # the bot still answers coherently - proves the pipeline recovered rather
+  # than being left in a broken/confused state.
+  - user: "What is your name?"
+    send_after:
+      event: user_started_speaking
+      delay_ms: 1500
+    expect:
+      - event: user_transcription
+        within_ms: 6000
+      - event: llm_response
+        within_ms: 10000

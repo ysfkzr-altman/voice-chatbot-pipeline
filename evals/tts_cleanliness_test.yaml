@@ -1,0 +1,39 @@
+name: tts_cleanliness_test
+
+# Tests whether markdown/lists/symbols/URLs leak into what actually gets
+# sent to TTS. Prompts the LLM with requests that naturally invite
+# list-formatted or symbol-heavy answers, and inspects the literal text
+# handed to the TTS engine (tts_response - the real text Kokoro was asked
+# to speak, not a transcription).
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/tts_cleanliness_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+judge:
+  modality: audio
+  transcription:
+    service: moonshine
+
+turns:
+  - user: "Give me a numbered list of three fruits."
+    expect:
+      - event: tts_response
+        within_ms: 10000
+
+  - user: "What's a good website for learning Python? Just give me the URL."
+    expect:
+      - event: tts_response
+        within_ms: 10000
+
+  - user: "Write the numbers one through five using digits, with commas between them, like a big number."
+    expect:
+      - event: tts_response
+        within_ms: 10000
