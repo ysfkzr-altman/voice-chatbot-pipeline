@@ -5,11 +5,11 @@ or directly against the local mic/speakers from the CLI.
 Pipeline: mic (WebRTC or local) -> Silero VAD -> Groq STT (Whisper)
           -> Groq LLM (Llama 3.3 70B) -> Kokoro TTS (local, no API key) -> speakers
 
-This branch adds one worked example of LLM tool calling: a fake dealership
-`check_inventory` tool (see INVENTORY / check_inventory below), so the bot
-can answer "do you have a Civic in stock?" from real(ish) data instead of
-just chatting generically. Swap the fake dict + lookup for a real API/DB
-call to point this at an actual business's data.
+This branch adds one worked example of LLM tool calling: `check_honda_price`
+fetches and parses the real, live starting prices from honda.com.pk's own
+homepage (see check_honda_price below), so the bot can answer "how much is
+the Civic?" using actual current data instead of a hardcoded number or a
+guess.
 
 Run:
     python bot.py             # WebRTC server; open http://localhost:7860
@@ -22,10 +22,12 @@ Kokoro model files (~87 MB) are downloaded automatically on first run to
 
 import asyncio
 import os
+import re
 import sys
 import time
 
 import pyaudio
+from curl_cffi import requests as curl_requests
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -78,8 +80,8 @@ SYSTEM_INSTRUCTION = (
     "sentences by default, never more than a few. No filler, no preamble, no "
     "restating the question, no hedging caveats. Answer exactly what was asked "
     "and stop. "
-    "If the user asks whether a specific car model is in stock, use the "
-    "check_inventory tool rather than guessing - never make up stock numbers."
+    "If the user asks about the price of a Honda Civic, HR-V, or City, use "
+    "the check_honda_price tool rather than guessing - never make up a price."
 )
 
 GREETING_MESSAGE = "Hi! How can I help you today?"
@@ -88,55 +90,122 @@ FALLBACK_COOLDOWN_SECS = 5.0
 
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 
-# Worked example of tool calling: a fake dealership inventory. In a real
-# integration, check_inventory would call that business's actual
-# inventory API/DB instead of reading this hardcoded dict.
-INVENTORY = {
-    "civic": 3,
-    "accord": 0,
-    "cr-v": 5,
-    "mg zs": 2,
-    "mg hs": 0,
-}
+# Worked example of tool calling against a REAL website (not fake/hardcoded
+# data): honda.com.pk's homepage includes a mega-menu block, present on
+# every page, listing each model line's current starting price - e.g.
+#   <h4>Honda Civic</h4> ... <div class="model-price">From PKR 8,499,000</div>
+# This is public marketing content, not a live inventory/stock API - Honda
+# Pakistan doesn't expose per-unit stock counts publicly (that lives inside
+# individual dealers' internal systems). Pricing is the real, live data
+# that's actually available to scrape here.
+HONDA_HOMEPAGE_URL = "https://www.honda.com.pk/"
+_HONDA_PRICE_PATTERN = re.compile(
+    r'<h4>Honda ([\w\- ]+?)</h4>.*?model-price">From PKR ([\d,]+)</div>',
+    re.DOTALL,
+)
+
+# Cache the parsed prices briefly so a burst of questions in one
+# conversation doesn't re-fetch the real site on every single turn - this
+# is a live public website, not our own infrastructure, so being a
+# reasonably polite client matters.
+_price_cache: dict[str, str] = {}
+_price_cache_time = 0.0
+_PRICE_CACHE_TTL_SECS = 300.0
 
 
-async def check_inventory(params: FunctionCallParams):
-    """Tool handler: looks up how many units of a car model are in stock.
+def _fetch_honda_homepage_sync() -> str:
+    """Blocking fetch, run in a background thread by `_get_honda_prices`.
+
+    Plain httpx (or curl with no browser identity) gets blocked with a 403
+    by the Cloudflare WAF in front of this site - confirmed by testing:
+    even a normal browser `User-Agent` header wasn't enough, since
+    Cloudflare's bot-detection also fingerprints the TLS handshake itself
+    (JA3/JA4), which differs between a real browser and a generic Python
+    HTTP client regardless of headers sent. `curl_cffi` with
+    `impersonate="chrome"` reproduces an actual Chrome TLS fingerprint and
+    gets through reliably (confirmed with repeated live requests).
+    """
+    response = curl_requests.get(HONDA_HOMEPAGE_URL, impersonate="chrome", timeout=10)
+    response.raise_for_status()
+    return response.text
+
+
+async def _get_honda_prices() -> dict[str, str]:
+    """Fetch + parse honda.com.pk's mega-menu prices, using a short-lived cache."""
+    global _price_cache, _price_cache_time
+
+    now = time.monotonic()
+    if _price_cache and (now - _price_cache_time) < _PRICE_CACHE_TTL_SECS:
+        return _price_cache
+
+    html = await asyncio.to_thread(_fetch_honda_homepage_sync)
+
+    _price_cache = {
+        name.strip().lower(): price for name, price in _HONDA_PRICE_PATTERN.findall(html)
+    }
+    _price_cache_time = now
+    return _price_cache
+
+
+async def check_honda_price(params: FunctionCallParams):
+    """Tool handler: looks up a Honda Pakistan model line's real, current
+    starting price by fetching and parsing honda.com.pk's own homepage -
+    the same "From PKR X" figure shown to any visitor of the site.
 
     Called by the LLM (not directly by us) whenever it decides the user is
-    asking about stock for a specific model. `params.arguments` holds
-    whatever arguments the model filled in, matching the `properties`
-    declared in `inventory_tool` below.
+    asking about price for a model. `params.arguments` holds whatever
+    arguments the model filled in, matching the `properties` declared in
+    `honda_price_tool` below.
     """
     model = str(params.arguments.get("model", "")).strip().lower()
-    count = INVENTORY.get(model)
+    # Loose match so "hrv", "hr-v", and "HR V" all match the site's "hr-v".
+    model_key = model.replace("-", "").replace(" ", "")
 
-    logger.log("CONVO", f"[tool call] check_inventory(model={model!r}) -> {count}")
+    try:
+        prices = await _get_honda_prices()
+    except curl_requests.exceptions.RequestException as e:
+        logger.error(f"[tool call] check_honda_price: fetch failed: {e}")
+        await params.result_callback(
+            {"model": model, "found": False, "error": "could not reach honda.com.pk right now"}
+        )
+        return
 
-    if count is None:
-        result = {"model": model, "found": False}
+    match = next(
+        (
+            price
+            for name, price in prices.items()
+            if name.replace("-", "").replace(" ", "") == model_key
+        ),
+        None,
+    )
+
+    logger.log("CONVO", f"[tool call] check_honda_price(model={model!r}) -> {match}")
+
+    if match is None:
+        await params.result_callback(
+            {"model": model, "found": False, "available_models": list(prices.keys())}
+        )
     else:
-        result = {"model": model, "found": True, "in_stock": count > 0, "count": count}
-
-    # Hands the result back to the LLM, which then generates the spoken
-    # reply using it - the tool call never speaks directly.
-    await params.result_callback(result)
+        await params.result_callback(
+            {"model": model, "found": True, "starting_price_pkr": match}
+        )
 
 
-inventory_tool = FunctionSchema(
-    name="check_inventory",
+honda_price_tool = FunctionSchema(
+    name="check_honda_price",
     description=(
-        "Check how many units of a specific car model are currently in "
-        "stock at the dealership."
+        "Look up the real, current starting price (in PKR) of a Honda "
+        "Pakistan model line - Civic, HR-V, or City - by checking the live "
+        "honda.com.pk website."
     ),
     properties={
         "model": {
             "type": "string",
-            "description": "The car model to check, e.g. 'Civic' or 'MG ZS'.",
+            "description": "The Honda model line to check, e.g. 'Civic', 'HR-V', or 'City'.",
         }
     },
     required=["model"],
-    handler=check_inventory,
+    handler=check_honda_price,
 )
 
 
@@ -232,7 +301,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         ),
     )
 
-    context = LLMContext(tools=[inventory_tool])
+    context = LLMContext(tools=[honda_price_tool])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),

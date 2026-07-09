@@ -1,7 +1,9 @@
 name: tool_calling_test
 
-# Verifies the check_inventory tool-calling demo actually gets invoked and
-# the reply reflects the real (fake) inventory data, not a guess.
+# Verifies the check_honda_price tool-calling demo actually gets invoked
+# and fetches REAL, live data from honda.com.pk (not a hardcoded number).
+# Doesn't assert an exact price since Honda can change pricing at any
+# time - just that the tool fired and the reply contains a real PKR figure.
 #
 # Run (two terminals):
 #   python bot.py -t eval
@@ -15,20 +17,20 @@ user:
     sample_rate: 16000
 
 turns:
-  - user: "Do you have a Civic in stock?"
+  - user: "How much does the Honda Civic cost?"
     expect:
       - event: function_call
-        name: check_inventory
+        name: check_honda_price
         within_ms: 10000
       - event: llm_response
-        text_contains: "3"
+        text_contains: "PKR"
         within_ms: 15000
 
-  - user: "What about the Accord?"
+  - user: "What about the HR-V?"
     expect:
       - event: function_call
-        name: check_inventory
+        name: check_honda_price
         within_ms: 10000
       - event: llm_response
-        eval: "Does the response say the Accord is out of stock, unavailable, or has zero units?"
+        text_contains: "PKR"
         within_ms: 15000
