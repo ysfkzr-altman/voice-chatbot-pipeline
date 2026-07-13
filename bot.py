@@ -27,7 +27,7 @@ from num2words import num2words
 
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame, Frame, TextFrame, TTSSpeakFrame
+from pipecat.frames.frames import ErrorFrame, Frame, TextFrame, TranscriptionFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -101,7 +101,10 @@ KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 # the English candidate's confidence score, only when the winning
 # transcript is short enough to plausibly be one of these cases.
 SHORT_UTTERANCE_CHAR_THRESHOLD = 12
-SHORT_UTTERANCE_EN_BIAS = 0.3
+# 0.3 wasn't enough in practice - measured the real gap for "Mm-hmm"
+# directly (en=-0.717 vs ur=-0.212, a 0.5 gap) and it still lost. 0.7
+# comfortably covers the measured case with some margin.
+SHORT_UTTERANCE_EN_BIAS = 0.7
 
 
 def _avg_logprob(result: Transcription) -> float:
@@ -214,6 +217,44 @@ def _normalize_for_speech(text: str) -> str:
     return text
 
 
+# Confirmed problem #3 (partial fix - see the reverted commit above for
+# the part that couldn't be fixed): pipecat's interruption mechanism
+# stops the bot's audio the moment VAD detects speech, before STT even
+# runs, so nothing at this layer can prevent the acoustic cutoff itself.
+# What this DOES fix: once cut off, the backchannel sound used to get
+# sent to the LLM and treated as a real question. Deliberately restricted
+# to genuinely non-lexical filler sounds - excludes real words like
+# "yeah"/"okay"/"right" that could be a legitimate short answer, since
+# silently dropping those would conflict with the ambiguous-input fix
+# above (which asks for clarification rather than ignoring a short
+# reply).
+# Matched after stripping everything but letters (see BackchannelFilter),
+# so e.g. Whisper's "M.M. Humm." normalizes to "mmhumm" before comparing -
+# these entries are deliberately written in that same stripped form.
+_BACKCHANNEL_WORDS = {
+    "mm", "mmhmm", "mmhumm", "hmm", "hm", "uhhuh", "mhm",
+}
+
+
+class BackchannelFilter(FrameProcessor):
+    """Drops transcribed backchannel filler sounds before they reach the
+    user-turn aggregator, so they're never sent to the LLM as if they
+    were a real question. Placed between `stt` and `user_aggregator`.
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            # Strip everything but letters - Whisper's punctuation choices
+            # for filler sounds are inconsistent ("Mm-hmm" vs "M.M. Humm."
+            # vs "Mmhmm.") so match on letters alone.
+            normalized = re.sub(r"[^a-z]", "", frame.text.lower())
+            if normalized in _BACKCHANNEL_WORDS:
+                logger.debug(f"Dropping backchannel-only transcript: {frame.text!r}")
+                return
+        await self.push_frame(frame, direction)
+
+
 class TTSTextNormalizer(FrameProcessor):
     """Rewrites text frames into speech-friendly form right before TTS.
 
@@ -252,9 +293,19 @@ class ConservativeSmartTurnAnalyzer(LocalSmartTurnAnalyzerV3):
     rather than cutting the user off mid-thought. Trade-off: in genuinely
     ambiguous cases, the bot may pause slightly longer before responding
     than it would with the stock 0.5 threshold.
+
+    Threshold picked from direct measurement, not guessed: fed real
+    Kokoro-synthesized audio straight to `_predict_endpoint` for both a
+    genuinely complete short utterance ("Yes." -> 0.8548) and the
+    confirmed incomplete mid-sentence fragment ("Write the numbers 1
+    through 5 using digits," -> 0.7434). An initial guess of 0.85 sat
+    right on top of "Yes."'s score - in the live pipeline this pushed
+    "Yes." just under the threshold, triggering Smart Turn's own internal
+    3-second silence fallback instead of a near-instant response. 0.80
+    keeps the fragment rejected with real margin on both sides.
     """
 
-    COMPLETION_THRESHOLD = 0.85
+    COMPLETION_THRESHOLD = 0.80
 
     def _predict_endpoint(self, audio_array):
         result = super()._predict_endpoint(audio_array)
@@ -273,6 +324,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     )
 
     tts_text_normalizer = TTSTextNormalizer()
+    backchannel_filter = BackchannelFilter()
 
     llm = GroqLLMService(
         api_key=os.environ["GROQ_API_KEY"],
@@ -317,6 +369,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         [
             transport.input(),  # Mic input
             stt,  # Speech -> text
+            backchannel_filter,  # Drop backchannel-only transcripts
             user_aggregator,  # Collect user turn
             llm,  # Generate response
             tts_text_normalizer,  # Clean up text before it's spoken
