@@ -27,7 +27,6 @@ from num2words import num2words
 
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import ErrorFrame, Frame, TextFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -103,22 +102,6 @@ KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 # transcript is short enough to plausibly be one of these cases.
 SHORT_UTTERANCE_CHAR_THRESHOLD = 12
 SHORT_UTTERANCE_EN_BIAS = 0.3
-
-# Confirmed problem #3: VAD's default start_secs=0.2 means any sound
-# sustained for just 0.2s - including a short backchannel acknowledgment
-# like "Mm-hmm" - is enough to declare "user started speaking" and
-# unconditionally broadcast an interruption (pipecat's
-# UserTurnProcessor._on_user_turn_started has no minimum-duration or
-# confidence gate of its own). Raising start_secs requires a longer
-# sustained sound before an interruption is triggered at all, so brief
-# acknowledgment sounds are more likely to finish before crossing the
-# threshold. Trade-off: genuine short interruptions (e.g. a quick "stop")
-# also take a little longer to register - this raises the bar rather than
-# distinguishing intent, since pipecat has no built-in way to know a
-# sound is a backchannel until well after acoustic detection already
-# happened. Left stop_secs at its default: pipecat's own turn-analyzer
-# code warns that Smart Turn's calibration assumes stop_secs=0.2.
-VAD_START_SECS = 0.6
 
 
 def _avg_logprob(result: Transcription) -> float:
@@ -307,7 +290,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(start_secs=VAD_START_SECS)),
+            vad_analyzer=SileroVADAnalyzer(),
             # Explicit, deliberate choice (was previously an unexamined
             # default - see ConservativeSmartTurnAnalyzer docstring).
             user_turn_strategies=UserTurnStrategies(
