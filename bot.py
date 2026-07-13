@@ -16,15 +16,17 @@ Kokoro model files (~87 MB) are downloaded automatically on first run to
 
 import asyncio
 import os
+import re
 import sys
 import time
 
 import pyaudio
 from dotenv import load_dotenv
 from loguru import logger
+from num2words import num2words
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
+from pipecat.frames.frames import ErrorFrame, Frame, TextFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -32,6 +34,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import EvalRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.kokoro.tts import KokoroTTSService
@@ -84,6 +87,16 @@ FALLBACK_ERROR_MESSAGE = "Sorry, I hit a glitch there. Could you say that again?
 FALLBACK_COOLDOWN_SECS = 5.0
 
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+
+# Confirmed problem #12: very short utterances (backchannel-style sounds
+# like "Mm-hmm", or short interruption phrases like "Wait, stop") kept
+# getting misclassified as Urdu gibberish instead of the English that was
+# actually said - short/ambiguous audio gives Whisper's Urdu pass just
+# enough room to produce a confidently-wrong result. Applied as a bonus to
+# the English candidate's confidence score, only when the winning
+# transcript is short enough to plausibly be one of these cases.
+SHORT_UTTERANCE_CHAR_THRESHOLD = 12
+SHORT_UTTERANCE_EN_BIAS = 0.3
 
 
 def _avg_logprob(result: Transcription) -> float:
@@ -143,8 +156,20 @@ class BilingualGroqSTTService(GroqSTTService):
         )
 
         conf_en, conf_ur = _avg_logprob(result_en), _avg_logprob(result_ur)
+
+        # Bias toward English for short candidates - see
+        # SHORT_UTTERANCE_EN_BIAS above for why. Based on the English
+        # candidate's own length, not Urdu's, so a genuinely short Urdu
+        # utterance doesn't get penalized by comparison to a long
+        # (likely-wrong) English guess for the same audio.
+        biased_conf_en = conf_en
+        if len(result_en.text.strip()) <= SHORT_UTTERANCE_CHAR_THRESHOLD:
+            biased_conf_en += SHORT_UTTERANCE_EN_BIAS
+
         winner, lang, conf = (
-            (result_en, "en", conf_en) if conf_en >= conf_ur else (result_ur, "ur", conf_ur)
+            (result_en, "en", conf_en)
+            if biased_conf_en >= conf_ur
+            else (result_ur, "ur", conf_ur)
         )
 
         # repr() is ASCII-safe: shows \uXXXX escapes for non-Latin chars so
@@ -156,6 +181,53 @@ class BilingualGroqSTTService(GroqSTTService):
         return winner
 
 
+# Confirmed problem #10: nothing enforced that LLM output stays
+# speech-friendly beyond asking nicely in the system prompt, which isn't
+# reliable - confirmed with a real example where the LLM produced the
+# literal text "1,2,3,4,5" instead of speaking the numbers as words.
+# Matches either a short comma-separated list of small numbers (read as
+# separate numbers, e.g. "1,2,3,4,5" -> "one, two, three, four, five") or
+# any other standalone number (read as one number, so "8,499,000" becomes
+# "eight million, four hundred and ninety-nine thousand" instead of a
+# raw digit string with commas in it, which doesn't read naturally aloud).
+_NUMBER_LIST_PATTERN = re.compile(r"\b\d{1,2}(?:,\d{1,2}){2,}\b")
+_NUMBER_PATTERN = re.compile(r"\b\d[\d,]*\b")
+
+
+def _normalize_for_speech(text: str) -> str:
+    def _replace_list(match: re.Match) -> str:
+        return ", ".join(num2words(int(part)) for part in match.group(0).split(","))
+
+    def _replace_number(match: re.Match) -> str:
+        try:
+            return num2words(int(match.group(0).replace(",", "")))
+        except ValueError:
+            return match.group(0)
+
+    text = _NUMBER_LIST_PATTERN.sub(_replace_list, text)
+    text = _NUMBER_PATTERN.sub(_replace_number, text)
+    return text
+
+
+class TTSTextNormalizer(FrameProcessor):
+    """Rewrites text frames into speech-friendly form right before TTS.
+
+    A backup for the system prompt's "keep it speakable" instruction, which
+    isn't reliable on its own (see the module comment above `_NUMBER_LIST_PATTERN`).
+    Placed between `llm` and `tts` in the pipeline so it sees exactly what's
+    about to be spoken, regardless of whether it came from the LLM or a
+    direct `TTSSpeakFrame` (greeting/fallback).
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        # TTSSpeakFrame (the greeting/fallback) isn't a TextFrame subclass -
+        # checked separately so those get normalized too, not just LLM output.
+        if isinstance(frame, (TextFrame, TTSSpeakFrame)) and frame.text:
+            frame.text = _normalize_for_speech(frame.text)
+        await self.push_frame(frame, direction)
+
+
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
@@ -165,6 +237,8 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     tts = KokoroTTSService(
         settings=KokoroTTSService.Settings(voice=KOKORO_VOICE),
     )
+
+    tts_text_normalizer = TTSTextNormalizer()
 
     llm = GroqLLMService(
         api_key=os.environ["GROQ_API_KEY"],
@@ -191,6 +265,12 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     @assistant_aggregator.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message):
         logger.log("CONVO", f"Bot: {message.content}")
+        nonlocal consecutive_fallback_failures, circuit_open_until
+        # A real assistant turn completed successfully - close the circuit
+        # breaker below entirely, so a transient blip doesn't leave things
+        # backed off longer than necessary once the service has recovered.
+        consecutive_fallback_failures = 0
+        circuit_open_until = 0.0
 
     pipeline = Pipeline(
         [
@@ -198,6 +278,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             stt,  # Speech -> text
             user_aggregator,  # Collect user turn
             llm,  # Generate response
+            tts_text_normalizer,  # Clean up text before it's spoken
             tts,  # Text -> speech
             transport.output(),  # Speaker output
             assistant_aggregator,  # Collect assistant turn
@@ -212,11 +293,20 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         ),
     )
 
-    last_fallback_speak_time = 0.0
+    # Confirmed problem #7: a flat per-attempt cooldown still lets the
+    # fallback fire indefinitely during a genuine outage (every
+    # FALLBACK_COOLDOWN_SECS, forever). This is a real circuit breaker
+    # instead: each consecutive failure doubles how long the circuit stays
+    # open (backoff grows 5s -> 10s -> 20s -> ... capped at
+    # CIRCUIT_BREAKER_MAX_BACKOFF_SECS), and a single successful turn
+    # (on_assistant_turn_stopped above) closes it again completely.
+    consecutive_fallback_failures = 0
+    circuit_open_until = 0.0
+    CIRCUIT_BREAKER_MAX_BACKOFF_SECS = 60.0
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(worker, frame: ErrorFrame):
-        nonlocal last_fallback_speak_time
+        nonlocal consecutive_fallback_failures, circuit_open_until
         logger.error(f"Pipeline error from {frame.processor}: {frame.error}")
         if frame.fatal:
             return
@@ -230,13 +320,11 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             logger.error("TTS itself is failing - not attempting a spoken fallback (would loop).")
             return
 
-        # General safety net: never fire the spoken fallback more than once
-        # every FALLBACK_COOLDOWN_SECS, regardless of source, in case some
-        # other repeat-failure pattern (e.g. STT down on every turn) shows up.
         now = time.monotonic()
-        if now - last_fallback_speak_time < FALLBACK_COOLDOWN_SECS:
+        if now < circuit_open_until:
+            # Already backed off from a recent run of failures - stay quiet
+            # rather than speaking (and failing) again immediately.
             return
-        last_fallback_speak_time = now
 
         # A non-fatal ErrorFrame (STT/LLM/TTS hiccup, rate limit, etc.) would
         # otherwise just get logged, leaving the user hearing silence for
@@ -244,6 +332,17 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # continue. append_to_context=False keeps it out of the LLM history.
         await worker.queue_frames(
             [TTSSpeakFrame(text=FALLBACK_ERROR_MESSAGE, append_to_context=False)]
+        )
+
+        consecutive_fallback_failures += 1
+        backoff = min(
+            FALLBACK_COOLDOWN_SECS * (2 ** (consecutive_fallback_failures - 1)),
+            CIRCUIT_BREAKER_MAX_BACKOFF_SECS,
+        )
+        circuit_open_until = now + backoff
+        logger.error(
+            f"Circuit breaker: {consecutive_fallback_failures} consecutive failure(s), "
+            f"backing off spoken fallback for {backoff:.0f}s."
         )
 
     # Speak a fixed greeting directly instead of round-tripping through the LLM

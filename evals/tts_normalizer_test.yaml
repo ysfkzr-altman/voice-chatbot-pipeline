@@ -1,0 +1,27 @@
+name: tts_normalizer_test
+
+# Verifies the fix for confirmed problem #10: reproduces the exact original
+# bug scenario (asking for digits/commas) and checks the text actually
+# handed to TTS is speech-friendly words, not raw "1,2,3,4,5".
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/tts_normalizer_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+judge:
+  modality: audio
+  transcription:
+    service: moonshine
+
+turns:
+  - user: "Write the numbers one through five using digits, with commas between them, like a big number."
+    expect:
+      - event: tts_response
+        within_ms: 15000
