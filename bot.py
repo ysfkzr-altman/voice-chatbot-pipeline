@@ -44,6 +44,9 @@ from pipecat.workers.runner import WorkerRunner
 
 load_dotenv(override=True)
 
+if "GROQ_API_KEY" not in os.environ:
+    sys.exit("GROQ_API_KEY is missing - add it to your .env file.")
+
 # Windows consoles default to cp1252, which can't encode Urdu/Arabic script.
 # Reconfigure stderr to UTF-8 before loguru attaches so transcripts print
 # correctly instead of crashing or showing ???.
@@ -69,7 +72,11 @@ SYSTEM_INSTRUCTION = (
     "Keep every response short and direct — one or two "
     "sentences by default, never more than a few. No filler, no preamble, no "
     "restating the question, no hedging caveats. Answer exactly what was asked "
-    "and stop."
+    "and stop. "
+    "If the user's message is too short, vague, or ambiguous to answer "
+    "meaningfully (e.g. a single word like 'yes' or 'ok' with no clear "
+    "context), don't guess at what they might mean - ask a brief clarifying "
+    "question instead."
 )
 
 GREETING_MESSAGE = "Hi! How can I help you today?"
@@ -321,12 +328,43 @@ async def run_local():
     await run_bot(transport, handle_sigint=True)
 
 
+def _check_port_available(host: str, port: int) -> None:
+    """Exit with a clear message if `port` is already bound.
+
+    pipecat's own WebRTC runner prints "Bot ready!" (see
+    `pipecat.runner.run.main`, which calls `_print_startup_message` before
+    `uvicorn.run`) BEFORE it actually attempts to bind the port - so a
+    second instance started against an already-used port prints a false
+    "ready" message and only fails later. Checking here, before handing
+    off to pipecat's runner at all, avoids that misleading sequence.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        try:
+            s.bind((host, port))
+        except OSError:
+            sys.exit(
+                f"Port {port} on {host} is already in use - is another "
+                f"instance of this bot already running?"
+            )
+
+
 if __name__ == "__main__":
     import asyncio
 
     if "--local" in sys.argv:
         asyncio.run(run_local())
     else:
-        from pipecat.runner.run import main
+        from pipecat.runner.run import RUNNER_HOST, RUNNER_PORT, main
+
+        # Mirrors pipecat's own --host/--port argparse defaults so this
+        # check targets the same address the runner will actually bind.
+        host = sys.argv[sys.argv.index("--host") + 1] if "--host" in sys.argv else RUNNER_HOST
+        port = (
+            int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else RUNNER_PORT
+        )
+        _check_port_available(host, port)
 
         main()
