@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from loguru import logger
 from num2words import num2words
 
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import ErrorFrame, Frame, TextFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -36,6 +37,10 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import EvalRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
+    TurnAnalyzerUserTurnStopStrategy,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.runner.utils import create_transport
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.groq.llm import GroqLLMService
@@ -228,6 +233,35 @@ class TTSTextNormalizer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class ConservativeSmartTurnAnalyzer(LocalSmartTurnAnalyzerV3):
+    """LocalSmartTurnAnalyzerV3 with a stricter completion threshold.
+
+    Confirmed problems #8 (a second turn-taking model - "Smart Turn" -
+    silently loads by default and can override how long the bot waits for
+    silence) and #11 (a single sentence with a natural mid-sentence pause
+    got cut into two separate turns, triggering a reply to only the first
+    half). Both trace to the same root cause: pipecat's own
+    `_predict_endpoint` hardcodes `prediction = 1 if probability > 0.5
+    else 0` with no constructor param to adjust it - a bare coin-flip
+    threshold for "is this sentence actually finished". Reproduced exactly
+    this failure: it predicted "complete" for audio ending mid-sentence
+    (a trailing comma before a continuing clause).
+
+    Requiring a higher-confidence probability before accepting "complete"
+    makes the model more conservative - biased toward waiting a bit longer
+    rather than cutting the user off mid-thought. Trade-off: in genuinely
+    ambiguous cases, the bot may pause slightly longer before responding
+    than it would with the stock 0.5 threshold.
+    """
+
+    COMPLETION_THRESHOLD = 0.85
+
+    def _predict_endpoint(self, audio_array):
+        result = super()._predict_endpoint(audio_array)
+        result["prediction"] = 1 if result["probability"] > self.COMPLETION_THRESHOLD else 0
+        return result
+
+
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
@@ -255,7 +289,14 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+            # Explicit, deliberate choice (was previously an unexamined
+            # default - see ConservativeSmartTurnAnalyzer docstring).
+            user_turn_strategies=UserTurnStrategies(
+                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=ConservativeSmartTurnAnalyzer())]
+            ),
+        ),
     )
 
     @user_aggregator.event_handler("on_user_turn_message_added")
