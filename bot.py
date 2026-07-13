@@ -471,6 +471,46 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         consecutive_fallback_failures = 0
         circuit_open_until = 0.0
 
+        if message.interrupted and message.content:
+            # Confirmed problem #9: when a response is cut off, pipecat
+            # still hands this handler the FULL generated text - and right
+            # after this handler returns, it broadcasts that same full
+            # text into the LLM context (LLMContextAssistantTurnFrame),
+            # regardless of how much was actually spoken before the
+            # interruption. Reproduced directly (a standalone context-dump
+            # probe): interrupting well under a second into a multi-sentence
+            # answer still left the complete, uncut text in context - the
+            # bot's memory claimed to have said things the user never
+            # actually heard.
+            #
+            # There's no clean hook to prevent that broadcast (it happens
+            # in pipecat's own code, after this handler, using a local
+            # variable this handler can't reach) or to know precisely how
+            # much audio was actually played. This corrects the record
+            # after the fact instead: find the just-broadcast entry by its
+            # (still-unique-enough) exact text and replace it with an
+            # explicit marker, so a later turn can't be misled by a
+            # fabricated "I already told you that" when it wasn't heard.
+            original_content = message.content
+
+            async def _correct_interrupted_context():
+                await asyncio.sleep(0.2)
+                messages = context.get_messages()
+                for i in reversed(range(len(messages))):
+                    if (
+                        messages[i].get("role") == "assistant"
+                        and messages[i].get("content") == original_content
+                    ):
+                        messages[i]["content"] = (
+                            "[This response was interrupted by the user before finishing - "
+                            "only part of it was actually heard, not the complete answer.]"
+                        )
+                        context.set_messages(messages)
+                        logger.debug("Corrected interrupted assistant turn in context")
+                        break
+
+            asyncio.create_task(_correct_interrupted_context())
+
     pipeline = Pipeline(
         [
             transport.input(),  # Mic input
