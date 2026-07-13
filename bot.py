@@ -15,6 +15,7 @@ Kokoro model files (~87 MB) are downloaded automatically on first run to
 """
 
 import asyncio
+import dataclasses
 import os
 import re
 import sys
@@ -27,7 +28,16 @@ from num2words import num2words
 
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame, Frame, TextFrame, TranscriptionFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    AggregatedTextFrame,
+    ErrorFrame,
+    Frame,
+    InterruptionFrame,
+    LLMFullResponseEndFrame,
+    TextFrame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -48,6 +58,8 @@ from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.whisper.base_stt import Transcription
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.utils.text.base_text_aggregator import AggregationType
+from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 from pipecat.workers.runner import WorkerRunner
 
 load_dotenv(override=True)
@@ -255,22 +267,116 @@ class BackchannelFilter(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+# Confirmed problem #6: Kokoro has a hard ~510-phoneme limit per request
+# and crashes (IndexError) instead of truncating gracefully when it's
+# exceeded. The max_completion_tokens cap on the LLM (see GroqLLMService
+# below) makes a single massive response unlikely, but doesn't rule out
+# one very long individual sentence with no punctuation to break on -
+# Kokoro's own internal sentence aggregation only splits on sentence
+# boundaries, not length. This is a hard backstop measured in characters
+# (not phonemes, which aren't cheap to compute here), picked
+# conservatively low relative to the ~510-phoneme limit so it trips well
+# before that regardless of how phoneme-dense the text is.
+KOKORO_MAX_CHUNK_CHARS = 300
+
+
+def _split_for_tts_safety(text: str) -> list[str]:
+    """Splits `text` into chunks no longer than KOKORO_MAX_CHUNK_CHARS,
+    breaking on word boundaries so words are never cut mid-way."""
+    if len(text) <= KOKORO_MAX_CHUNK_CHARS:
+        return [text]
+
+    chunks = []
+    current = ""
+    for word in text.split(" "):
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > KOKORO_MAX_CHUNK_CHARS and current:
+            chunks.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 class TTSTextNormalizer(FrameProcessor):
-    """Rewrites text frames into speech-friendly form right before TTS.
+    """Rewrites text into speech-friendly form right before TTS, and splits
+    any chunk that's too long for Kokoro into smaller pieces.
 
     A backup for the system prompt's "keep it speakable" instruction, which
     isn't reliable on its own (see the module comment above `_NUMBER_LIST_PATTERN`).
     Placed between `llm` and `tts` in the pipeline so it sees exactly what's
     about to be spoken, regardless of whether it came from the LLM or a
     direct `TTSSpeakFrame` (greeting/fallback).
+
+    The LLM streams its response as many small text fragments (sometimes a
+    single word or less per frame), not one complete string - confirmed
+    directly (bot.py's own CONVO log) that checking/transforming each
+    fragment independently doesn't work: a number-list spanning multiple
+    fragments never matches the list pattern, and a long response spread
+    across many short fragments never trips the length-based chunk split,
+    since Kokoro's own internal aggregator (`TTSService`/`SimpleTextAggregator`)
+    re-assembles the fragments into complete sentences *after* this
+    processor runs. Mirrors that same buffering here with another
+    `SimpleTextAggregator`, so normalization and length-splitting run on
+    complete sentences - what Kokoro will actually receive - not
+    fragments. Re-emits already-aggregated `AggregatedTextFrame`s so
+    `TTSService` uses them as-is instead of re-aggregating.
     """
+
+    def __init__(self):
+        super().__init__()
+        self._aggregator = SimpleTextAggregator()
+
+    async def _emit_normalized(self, text: str, direction: FrameDirection):
+        normalized = _normalize_for_speech(text)
+        chunks = _split_for_tts_safety(normalized)
+        if len(chunks) > 1:
+            logger.debug(
+                f"Splitting {len(normalized)}-char sentence into {len(chunks)} "
+                f"pieces before TTS (over KOKORO_MAX_CHUNK_CHARS)."
+            )
+        for chunk in chunks:
+            await self.push_frame(
+                AggregatedTextFrame(chunk, AggregationType.SENTENCE, raw_text=chunk), direction
+            )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        # TTSSpeakFrame (the greeting/fallback) isn't a TextFrame subclass -
-        # checked separately so those get normalized too, not just LLM output.
-        if isinstance(frame, (TextFrame, TTSSpeakFrame)) and frame.text:
-            frame.text = _normalize_for_speech(frame.text)
+
+        if isinstance(frame, InterruptionFrame):
+            # Discard any partially-buffered text from a response that got
+            # cut off - otherwise leftover text could leak into and corrupt
+            # the start of the next turn's response.
+            await self._aggregator.handle_interruption()
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, TTSSpeakFrame) and frame.text:
+            # Already a complete, one-shot utterance (greeting/fallback) -
+            # no streaming fragments to buffer.
+            normalized = _normalize_for_speech(frame.text)
+            for chunk in _split_for_tts_safety(normalized):
+                await self.push_frame(dataclasses.replace(frame, text=chunk), direction)
+            return
+
+        if isinstance(frame, LLMFullResponseEndFrame):
+            remaining = await self._aggregator.flush()
+            if remaining and remaining.text:
+                await self._emit_normalized(remaining.text, direction)
+            await self.push_frame(frame, direction)
+            return
+
+        if (
+            isinstance(frame, TextFrame)
+            and not isinstance(frame, AggregatedTextFrame)
+            and frame.text
+        ):
+            async for aggregation in self._aggregator.aggregate(frame.text):
+                await self._emit_normalized(aggregation.text, direction)
+            return
+
         await self.push_frame(frame, direction)
 
 
