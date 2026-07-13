@@ -1,8 +1,11 @@
 name: backchannel_test
 
-# Tests whether a short listener acknowledgment ("mm-hmm") while the bot is
-# talking gets wrongly treated as a real interruption/turn, instead of being
-# ignored as backchanneling. Synthesized via Kokoro, no human needed.
+# Verifies the fix for confirmed problem #3: a short listener
+# acknowledgment ("mm-hmm") played while the bot is talking should NOT be
+# treated as a real interruption. Fixed by raising VAD's start_secs (how
+# long a sound must be sustained before "user started speaking" fires,
+# which unconditionally triggers an interruption broadcast) - see
+# VAD_START_SECS in bot.py. Synthesized via Kokoro, no human needed.
 #
 # Run (two terminals):
 #   python bot.py -t eval
@@ -20,12 +23,22 @@ turns:
     expect:
       - event: llm_started
         within_ms: 8000
+      # The backchannel sound below is scheduled 900ms into this response.
+      # If it's still wrongly treated as an interruption, this response
+      # gets cut off and never completes - checking the full response
+      # actually arrives intact is a direct, positive proof that it
+      # didn't. within_ms is generous to cover the full round trip.
+      - event: llm_response
+        text_contains: "cycle"
+        within_ms: 12000
 
   # A short backchannel sound 900ms into the bot's response - not meant as
-  # an interruption, just listener feedback. There's no minimum-duration or
-  # confidence guard in the current VAD/interruption setup specifically for
-  # this, so this is expected to register as a full turn (getting picked up
-  # by VAD and transcribed) rather than being filtered out as a backchannel.
+  # an interruption, just listener feedback. The real assertion is turn
+  # 0's llm_response above completing intact; this expectation is
+  # expected to TIME OUT (no matching event) now that the fix is in -
+  # that's the desired outcome, confirming the short sound never crossed
+  # VAD_START_SECS. A pass here (event fires) would mean the fix
+  # regressed.
   - user: "Mm-hmm"
     send_after:
       event: llm_started
@@ -33,5 +46,3 @@ turns:
     expect:
       - event: user_started_speaking
         within_ms: 4000
-      - event: user_transcription
-        within_ms: 6000
