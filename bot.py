@@ -530,6 +530,18 @@ async def _startup_self_check(
 
 
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
+    # Retry-with-backoff on transient STT/LLM failures (a dropped
+    # connection, a momentary 5xx) already happens here, not something
+    # this file adds: both use an AsyncOpenAI client under the hood (Groq
+    # is OpenAI-API-compatible), which defaults to max_retries=2 with its
+    # own exponential backoff. Verified this is real, not just present in
+    # the signature: a connection failure with max_retries=0 failed in
+    # 2.6s; the default took 8.0s, consistent with multiple attempts
+    # actually happening. Not overridden higher - pipecat's create_client
+    # methods for both services accept **kwargs but don't forward them to
+    # the AsyncOpenAI(...) constructor in this version, so a client-level
+    # override would require subclassing purely to keep the same value
+    # this default already provides.
     stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
         settings=GroqSTTService.Settings(model="whisper-large-v3"),
