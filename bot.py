@@ -48,6 +48,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
+    LLMAssistantAggregatorParams,
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
@@ -591,6 +592,18 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
                 stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=ConservativeSmartTurnAnalyzer())]
             ),
         ),
+        # Bulletproofing: a long-running conversation would otherwise grow
+        # LLMContext unboundedly - every future turn resends the entire
+        # history, so cost/latency creep up forever and eventually risk
+        # hitting the model's real context limit. pipecat already ships a
+        # complete summarization mechanism for this (handles tool-call
+        # boundaries, preserves the system prompt) - it's just OFF by
+        # default (enable_auto_context_summarization=False). Turning it on
+        # with its own sensible defaults (compress once >8000 estimated
+        # tokens or >20 unsummarized messages, keeping the last 4 messages
+        # verbatim) rather than leaving this pipeline vulnerable to
+        # unbounded growth.
+        assistant_params=LLMAssistantAggregatorParams(enable_auto_context_summarization=True),
     )
 
     @user_aggregator.event_handler("on_user_turn_message_added")
@@ -667,6 +680,20 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        # Bulletproofing: made explicit rather than relying on the
+        # library default. If a connected user goes quiet for this long
+        # (no BotSpeakingFrame/UserSpeakingFrame at all), pipecat cancels
+        # this session's worker AND runner automatically - confirmed via
+        # pipecat's own runner source (background_tasks.add_task spawns
+        # an independent bot()/run_bot()/WorkerRunner() per WebRTC
+        # connection) that this is scoped to just that one connection,
+        # not the shared FastAPI server: an idle user's session cleanly
+        # tears down without affecting anyone else or requiring a
+        # restart. For --local mode there's only ever one worker for the
+        # whole process, so the same timeout just exits the CLI after
+        # this long with no mic activity - reasonable for a tool nobody's
+        # using anymore.
+        idle_timeout_secs=300.0,
     )
 
     # Confirmed problem #7: a flat per-attempt cooldown still lets the
