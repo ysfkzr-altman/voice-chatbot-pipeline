@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+import wave
 
 import pyaudio
 from dotenv import load_dotenv
@@ -36,7 +37,11 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     TextFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
     TTSSpeakFrame,
+    TTSTextFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -104,6 +109,36 @@ FALLBACK_ERROR_MESSAGE = "Sorry, I hit a glitch there. Could you say that again?
 FALLBACK_COOLDOWN_SECS = 5.0
 
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+
+# Bulletproofing: if Kokoro TTS ITSELF is what's failing (corrupted model,
+# crash, resource exhaustion), speaking a fallback apology through that
+# same broken TTS just triggers another failure - previously handled by
+# giving up silently (the user hears nothing at all, with no indication
+# anything went wrong). This is a pre-recorded WAV, generated once
+# offline via Kokoro itself and committed to the repo, played by pushing
+# its raw PCM samples directly to the transport - it never calls Kokoro's
+# synthesis pipeline, so it works even when that pipeline is what's
+# broken. See scripts/generate_fallback_audio.py to regenerate it.
+FALLBACK_AUDIO_PATH = os.path.join(os.path.dirname(__file__), "fallback_audio.wav")
+
+
+def _load_fallback_audio() -> tuple[bytes, int, int] | None:
+    """Loads the pre-recorded fallback WAV's raw PCM bytes + format.
+
+    Returns None (rather than raising) if the file is missing/unreadable -
+    a missing fallback file shouldn't itself crash bot startup, though it
+    does mean this specific safety net is unavailable.
+    """
+    try:
+        with wave.open(FALLBACK_AUDIO_PATH, "rb") as wf:
+            audio = wf.readframes(wf.getnframes())
+            return audio, wf.getframerate(), wf.getnchannels()
+    except OSError as e:
+        logger.error(f"Could not load fallback audio ({FALLBACK_AUDIO_PATH}): {e}")
+        return None
+
+
+FALLBACK_AUDIO = _load_fallback_audio()
 
 # Confirmed problem #12: very short utterances (backchannel-style sounds
 # like "Mm-hmm", or short interruption phrases like "Wait, stop") kept
@@ -551,28 +586,49 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         if frame.fatal:
             return
 
-        # If TTS itself is the thing failing, speaking a fallback apology
-        # through that same broken TTS just triggers another ErrorFrame,
-        # which re-triggers this handler - an infinite retry loop hammering
-        # the TTS API. Log only; there's no way to speak our way out of a
-        # dead TTS connection.
-        if frame.processor is tts:
-            logger.error("TTS itself is failing - not attempting a spoken fallback (would loop).")
-            return
-
         now = time.monotonic()
         if now < circuit_open_until:
             # Already backed off from a recent run of failures - stay quiet
             # rather than speaking (and failing) again immediately.
             return
 
-        # A non-fatal ErrorFrame (STT/LLM/TTS hiccup, rate limit, etc.) would
-        # otherwise just get logged, leaving the user hearing silence for
-        # that turn. Speak a short apology instead so the conversation can
-        # continue. append_to_context=False keeps it out of the LLM history.
-        await worker.queue_frames(
-            [TTSSpeakFrame(text=FALLBACK_ERROR_MESSAGE, append_to_context=False)]
-        )
+        if frame.processor is tts:
+            # Speaking a fallback apology through the TTS engine that's
+            # itself broken would just trigger another ErrorFrame - an
+            # infinite retry loop hammering it. Play the pre-recorded WAV
+            # instead: raw PCM samples pushed straight to the transport,
+            # never touching Kokoro's synthesis pipeline at all.
+            if FALLBACK_AUDIO is None:
+                logger.error(
+                    "TTS itself is failing and no fallback audio is available "
+                    "- giving up silently for this turn."
+                )
+                return
+            # A bare OutputAudioRawFrame isn't recognized by the transport's
+            # speaking-detection logic (only TTSAudioRawFrame/
+            # SpeechOutputAudioRawFrame are - confirmed directly: the audio
+            # never triggered "bot started speaking" without this). The
+            # Started/Stopped pair mirrors what a real TTS service emits
+            # around its own audio, so the transport's start/stop-speaking
+            # bookkeeping behaves the same as for a normal spoken reply.
+            audio, sample_rate, num_channels = FALLBACK_AUDIO
+            await worker.queue_frames(
+                [
+                    TTSStartedFrame(),
+                    TTSTextFrame(FALLBACK_ERROR_MESSAGE, AggregationType.SENTENCE),
+                    TTSAudioRawFrame(audio=audio, sample_rate=sample_rate, num_channels=num_channels),
+                    TTSStoppedFrame(),
+                ]
+            )
+        else:
+            # A non-fatal ErrorFrame (STT/LLM hiccup, rate limit, etc.) would
+            # otherwise just get logged, leaving the user hearing silence for
+            # that turn. Speak a short apology instead so the conversation
+            # can continue. append_to_context=False keeps it out of the LLM
+            # history.
+            await worker.queue_frames(
+                [TTSSpeakFrame(text=FALLBACK_ERROR_MESSAGE, append_to_context=False)]
+            )
 
         consecutive_fallback_failures += 1
         backoff = min(
