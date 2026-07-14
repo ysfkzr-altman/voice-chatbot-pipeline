@@ -35,6 +35,18 @@ Talk into your microphone; the bot replies out loud. Ctrl+C to stop.
 
 On first run, Kokoro downloads its model files (~87 MB) to `~/.cache/pipecat/kokoro-onnx/`. This only happens once.
 
+## Testing
+
+`evals/` holds automated scenarios (synthesized speech via Kokoro, no human needed) covering the confirmed edge cases in `EDGE_CASES.md`. Run the whole suite:
+
+```
+scripts/run_all_evals.sh
+```
+
+This starts a fresh `bot.py` process per scenario (running several scenarios against one long-lived process has caused real problems before - e.g. Kokoro TTS silently stopping after several turns), runs it, tears it down, and prints a pass/fail summary. Pass one or more names to run a subset: `scripts/run_all_evals.sh backchannel_test bargein_test`. Bot/eval logs land in `eval_logs/` (gitignored).
+
+Some scenarios use a local Ollama judge (`eval:` semantic checks) - if Ollama isn't running, those fail with an `APIConnectionError` unrelated to the bot itself; the summary flags which scenarios that applies to.
+
 ## Notes
 
 - `--local` uses `LocalAudioTransport` (your PC's mic/speakers directly via PyAudio, no browser). The default WebRTC mode serves a browser UI via `pipecat.runner.run`.
