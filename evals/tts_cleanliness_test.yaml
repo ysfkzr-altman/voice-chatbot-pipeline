@@ -6,6 +6,12 @@ name: tts_cleanliness_test
 # handed to the TTS engine (tts_response - the real text Kokoro was asked
 # to speak, not a transcription).
 #
+# within_ms is 15000, not a tighter value: Kokoro's synthesis time varies
+# run to run (observed ~1.2s to ~3s TTFB for similar-length text) - a
+# tighter window intermittently fails on real, correct behavior just
+# because that specific run happened to synthesize slower, not because
+# anything is actually broken.
+#
 # Run (two terminals):
 #   python bot.py -t eval
 #   pipecat eval run evals/tts_cleanliness_test.yaml -v
@@ -26,14 +32,14 @@ turns:
   - user: "Give me a numbered list of three fruits."
     expect:
       - event: tts_response
-        within_ms: 10000
+        within_ms: 15000
 
   - user: "What's a good website for learning Python? Just give me the URL."
     expect:
       - event: tts_response
-        within_ms: 10000
+        within_ms: 15000
 
   - user: "Write the numbers one through five using digits, with commas between them, like a big number."
     expect:
       - event: tts_response
-        within_ms: 10000
+        within_ms: 15000

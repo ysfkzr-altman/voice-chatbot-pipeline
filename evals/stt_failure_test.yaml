@@ -8,8 +8,15 @@ name: stt_failure_test
 # key) to verify the actual synthesized apology text, not just that some
 # event fired.
 #
+# Also requires SKIP_STARTUP_SELF_CHECK=1: bot.py's own startup self-check
+# (added for bulletproofing) would otherwise catch this same bad key at
+# startup and exit before this scenario ever gets a chance to run - this
+# is the one deliberate, intentional case where bypassing that check is
+# correct (everywhere else, a real startup failure should exit fast).
+#
 # Run (two terminals):
 #   set GROQ_API_KEY=bad_key_for_testing
+#   set SKIP_STARTUP_SELF_CHECK=1
 #   python bot.py -t eval
 #
 #   (separate terminal, real key not needed for the eval client itself)

@@ -16,6 +16,7 @@ Kokoro model files (~87 MB) are downloaded automatically on first run to
 
 import asyncio
 import dataclasses
+import io
 import os
 import re
 import sys
@@ -248,6 +249,18 @@ class BilingualGroqSTTService(GroqSTTService):
 _NUMBER_LIST_PATTERN = re.compile(r"\b\d{1,2}(?:,\d{1,2}){2,}\b")
 _NUMBER_PATTERN = re.compile(r"\b\d[\d,]*\b")
 
+# Found while bulletproofing: asking for "a website, just give me the URL"
+# made the LLM produce a raw URL (e.g.
+# "https://docs.python.org/three/tutorial/index.html") straight into TTS.
+# Beyond being unintelligible read aloud character-by-character, the
+# unusual punctuation density measurably slowed Kokoro's synthesis (5.3s
+# TTFB for that one line, vs. a typical ~1-2s) - a real latency/reliability
+# risk, not just a quality one. Replaced wholesale with a short spoken
+# placeholder rather than trying to "read out" the domain - a URL's path/
+# query string can contain arbitrary other unusual characters a
+# domain-only conversion wouldn't protect against.
+_URL_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+
 
 def _normalize_for_speech(text: str) -> str:
     def _replace_list(match: re.Match) -> str:
@@ -259,6 +272,7 @@ def _normalize_for_speech(text: str) -> str:
         except ValueError:
             return match.group(0)
 
+    text = _URL_PATTERN.sub("a link", text)
     text = _NUMBER_LIST_PATTERN.sub(_replace_list, text)
     text = _NUMBER_PATTERN.sub(_replace_number, text)
     return text
@@ -454,6 +468,67 @@ class ConservativeSmartTurnAnalyzer(LocalSmartTurnAnalyzerV3):
         return result
 
 
+async def _startup_self_check(
+    stt: "BilingualGroqSTTService", llm: GroqLLMService, tts: KokoroTTSService
+) -> None:
+    """Validates STT, LLM, and TTS actually work before accepting real
+    traffic - not just that a key is present (already checked at import
+    time), but that a real call to each service succeeds.
+
+    A revoked/expired key, a Groq quota/permission issue scoped to just
+    one endpoint, or a corrupted local Kokoro model would otherwise only
+    surface on the user's FIRST real turn, presenting as a mysterious
+    fallback apology with no clear cause. Failing fast here with a
+    specific error per service is much easier to diagnose than that.
+
+    Exits the process (does not raise) if any check fails, matching the
+    existing fail-fast behavior for a missing API key / port conflict.
+    """
+    errors = []
+
+    try:
+        await llm._client.chat.completions.create(
+            model=llm._settings.model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_completion_tokens=1,
+        )
+    except Exception as e:
+        errors.append(f"LLM (Groq chat completions, model={llm._settings.model}): {e}")
+
+    if FALLBACK_AUDIO is not None:
+        try:
+            audio, sample_rate, num_channels = FALLBACK_AUDIO
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(num_channels)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio)
+            await stt._client.audio.transcriptions.create(
+                file=("check.wav", buf.getvalue(), "audio/wav"),
+                model=stt._settings.model,
+                language="en",
+            )
+        except Exception as e:
+            errors.append(f"STT (Groq Whisper, model={stt._settings.model}): {e}")
+    else:
+        errors.append("STT check skipped - no fallback_audio.wav available to test with")
+
+    try:
+        async for _ in tts.run_tts("Hi", context_id="startup-self-check"):
+            pass
+    except Exception as e:
+        errors.append(f"TTS (Kokoro, voice={tts._settings.voice}): {e}")
+
+    if errors:
+        logger.error("Startup self-check FAILED - fix these before running the bot:")
+        for err in errors:
+            logger.error(f"  - {err}")
+        sys.exit(1)
+
+    logger.info("Startup self-check passed: STT, LLM, and TTS are all working.")
+
+
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
@@ -478,6 +553,20 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             max_completion_tokens=150,
         ),
     )
+
+    # Uses the same, fully-configured stt/llm/tts instances the pipeline
+    # will actually run with - not throwaway copies - so the check
+    # reflects the exact models/settings in use.
+    #
+    # Escape hatch for evals/stt_failure_test.yaml specifically: that test
+    # deliberately starts the bot with a broken GROQ_API_KEY to verify the
+    # mid-turn fallback-apology path still works when STT/LLM fail - this
+    # check would otherwise catch that same bad key here and exit before
+    # the scenario it's testing ever gets a chance to run.
+    if os.getenv("SKIP_STARTUP_SELF_CHECK"):
+        logger.warning("SKIPPING startup self-check (SKIP_STARTUP_SELF_CHECK is set).")
+    else:
+        await _startup_self_check(stt, llm, tts)
 
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(

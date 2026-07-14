@@ -39,8 +39,12 @@ declare -A DURATIONS
 # specifically needs a broken GROQ_API_KEY to exercise the STT-down
 # fallback path - starting it normally (real key) means STT succeeds and
 # the test can never see the behavior it's checking for.
+# SKIP_STARTUP_SELF_CHECK is also needed here: bot.py's own startup
+# self-check (added for bulletproofing) would otherwise catch this same
+# bad key and exit before the scenario ever gets a chance to run - this
+# is the one deliberate, intentional case where that's the wrong thing.
 declare -A SCENARIO_ENV=(
-    [stt_failure_test]="GROQ_API_KEY=bad_key_for_testing"
+    [stt_failure_test]="GROQ_API_KEY=bad_key_for_testing SKIP_STARTUP_SELF_CHECK=1"
 )
 
 # Scenarios whose `eval:` semantic-judge checks depend on a local Ollama
