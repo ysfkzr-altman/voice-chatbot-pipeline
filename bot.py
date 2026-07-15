@@ -262,6 +262,79 @@ _NUMBER_PATTERN = re.compile(r"\b\d[\d,]*\b")
 # domain-only conversion wouldn't protect against.
 _URL_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 
+# Polish pass found while auditing _normalize_for_speech: the generic
+# _NUMBER_PATTERN above treats digits as one big cardinal number regardless
+# of context, which is wrong for several common shapes an LLM answer can
+# contain. Each of these runs BEFORE _NUMBER_PATTERN so its digits are
+# already consumed (turned into words) by the time the generic pattern
+# would otherwise mangle them.
+#   - "$50"           -> "one big number" bug: dangling "$" was left in
+#                        place and spoken literally ("dollar sign fifty").
+#   - "95%"            -> same dangling-symbol problem with "%".
+#   - "3.14"           -> generic pattern only matches digits, so "3" and
+#                        "14" got converted separately either side of a
+#                        literal spoken period: "three.fourteen".
+#   - "555-123-4567"   -> read as one gigantic cardinal number instead of
+#                        digit-by-digit, which is how phone numbers are
+#                        actually spoken.
+#   - "3:30"           -> same problem as decimals, via ":" instead of ".".
+# Verified each independently against the previous behavior (see the
+# bash repro used while diagnosing this) before adding.
+_CURRENCY_PATTERN = re.compile(r"\$\d[\d,]*(?:\.\d{1,2})?")
+_PERCENT_PATTERN = re.compile(r"\b\d[\d,]*(?:\.\d+)?%")
+_PHONE_PATTERN = re.compile(r"\b\d{3}-\d{3}-\d{4}\b")
+_TIME_PATTERN = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b(\s*[ap]\.?m\.?)?", re.IGNORECASE)
+_DECIMAL_PATTERN = re.compile(r"\b\d+\.\d+\b")
+
+
+def _digits_to_words(digits: str) -> str:
+    return " ".join(num2words(int(d)) for d in digits)
+
+
+def _replace_currency(match: re.Match) -> str:
+    amount = match.group(0)[1:].replace(",", "")
+    dollars_str, _, cents_str = amount.partition(".")
+    dollars = int(dollars_str) if dollars_str else 0
+    words = f"{num2words(dollars)} dollars"
+    if cents_str:
+        cents = int(cents_str.ljust(2, "0")[:2])
+        if cents:
+            words += f" and {num2words(cents)} cents"
+    return words
+
+
+def _replace_percent(match: re.Match) -> str:
+    num_str = match.group(0)[:-1].replace(",", "")
+    whole_str, _, frac_str = num_str.partition(".")
+    words = num2words(int(whole_str)) if whole_str else "zero"
+    if frac_str:
+        words += f" point {_digits_to_words(frac_str)}"
+    return f"{words} percent"
+
+
+def _replace_phone(match: re.Match) -> str:
+    return _digits_to_words(match.group(0).replace("-", ""))
+
+
+def _replace_time(match: re.Match) -> str:
+    hour, minute, suffix = int(match.group(1)), int(match.group(2)), match.group(3)
+    hour_words = num2words(hour if hour else 12)
+    if minute == 0:
+        minute_words = "o'clock"
+    elif minute < 10:
+        minute_words = f"oh {num2words(minute)}"
+    else:
+        minute_words = num2words(minute)
+    result = f"{hour_words} {minute_words}"
+    if suffix:
+        result += " " + re.sub(r"\.", "", suffix.strip()).lower()
+    return result
+
+
+def _replace_decimal(match: re.Match) -> str:
+    whole, _, frac = match.group(0).partition(".")
+    return f"{num2words(int(whole))} point {_digits_to_words(frac)}"
+
 
 def _normalize_for_speech(text: str) -> str:
     def _replace_list(match: re.Match) -> str:
@@ -274,6 +347,11 @@ def _normalize_for_speech(text: str) -> str:
             return match.group(0)
 
     text = _URL_PATTERN.sub("a link", text)
+    text = _CURRENCY_PATTERN.sub(_replace_currency, text)
+    text = _PERCENT_PATTERN.sub(_replace_percent, text)
+    text = _PHONE_PATTERN.sub(_replace_phone, text)
+    text = _TIME_PATTERN.sub(_replace_time, text)
+    text = _DECIMAL_PATTERN.sub(_replace_decimal, text)
     text = _NUMBER_LIST_PATTERN.sub(_replace_list, text)
     text = _NUMBER_PATTERN.sub(_replace_number, text)
     return text
@@ -297,22 +375,65 @@ _BACKCHANNEL_WORDS = {
     "mm", "mmhmm", "mmhumm", "hmm", "hm", "uhhuh", "mhm",
 }
 
+# EDGE_CASES.md B6/G1: Whisper is documented to hallucinate plausible-
+# sounding stock phrases on short, quiet, or near-silent audio (a VAD
+# false-trigger on a cough, a chair creak, etc.). Unlike backchannel
+# filler, these come out as complete, grammatical sentences - not empty
+# and not a recognizable filler word - so neither push_empty_transcripts
+# nor _BACKCHANNEL_WORDS catches them, and the bot answers a turn nobody
+# actually said. A confidence-score cutoff was tried and rejected earlier
+# in this project (measured directly: hallucinated text on silence scores
+# competitively with real speech from this Whisper+Groq setup, so
+# avg_logprob can't distinguish them). This instead denylists the specific
+# stock phrases that are well-documented as Whisper's go-to hallucinations
+# (YouTube-outro-style boilerplate) - deliberately narrow and exact-match,
+# so it can't accidentally swallow a real, on-topic reply.
+_HALLUCINATION_PHRASES = {
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for watching this video",
+    "please subscribe",
+    "subscribe to my channel",
+    "dont forget to subscribe",
+    "like and subscribe",
+    "see you in the next video",
+    "ill see you in the next video",
+    "thanks for listening",
+}
+
 
 class BackchannelFilter(FrameProcessor):
-    """Drops transcribed backchannel filler sounds before they reach the
-    user-turn aggregator, so they're never sent to the LLM as if they
-    were a real question. Placed between `stt` and `user_aggregator`.
+    """Drops transcribed backchannel filler sounds and known Whisper
+    hallucination phrases before they reach the user-turn aggregator, so
+    neither is ever sent to the LLM as if it were a real question. Placed
+    between `stt` and `user_aggregator`.
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
+            lowered = frame.text.lower()
+
             # Strip everything but letters - Whisper's punctuation choices
             # for filler sounds are inconsistent ("Mm-hmm" vs "M.M. Humm."
             # vs "Mmhmm.") so match on letters alone.
-            normalized = re.sub(r"[^a-z]", "", frame.text.lower())
-            if normalized in _BACKCHANNEL_WORDS:
+            letters_only = re.sub(r"[^a-z]", "", lowered)
+            if letters_only in _BACKCHANNEL_WORDS:
                 logger.debug(f"Dropping backchannel-only transcript: {frame.text!r}")
+                return
+
+            # Same idea but keeping word boundaries, since these are
+            # multi-word phrases rather than single filler sounds. Substring
+            # containment, not exact equality: real hallucinated transcripts
+            # vary in surrounding wording ("Thanks for watching this video!"
+            # vs "Thanks for watching." vs "...watching, please subscribe!")
+            # while still reliably containing one of these distinctive
+            # markers verbatim - confirmed exact-match missed real variants
+            # ("Please subscribe to my channel." didn't equal either
+            # "please subscribe" or "subscribe to my channel" on its own).
+            words_only = " ".join(re.sub(r"[^a-z\s]", "", lowered).split())
+            if any(phrase in words_only for phrase in _HALLUCINATION_PHRASES):
+                logger.debug(f"Dropping known Whisper hallucination phrase: {frame.text!r}")
                 return
         await self.push_frame(frame, direction)
 
@@ -530,6 +651,17 @@ async def _startup_self_check(
     logger.info("Startup self-check passed: STT, LLM, and TTS are all working.")
 
 
+# Bug found while auditing this file for further hardening: pipecat spawns a
+# fresh run_bot() per WebRTC connection (background_tasks.add_task - see the
+# idle_timeout_secs comment below for the source), so without this flag every
+# single connection re-ran the self-check - 3 extra API round-trips (an LLM
+# call, an STT call, and a full Kokoro synthesis) added to that user's first-
+# turn latency, plus 3x the intended quota usage per session instead of once
+# per process. The services themselves (same API key, same models) don't
+# change between connections, so verifying them once per process is enough.
+_startup_self_check_done = False
+
+
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     # Retry-with-backoff on transient STT/LLM failures (a dropped
     # connection, a momentary 5xx) already happens here, not something
@@ -576,10 +708,16 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     # mid-turn fallback-apology path still works when STT/LLM fail - this
     # check would otherwise catch that same bad key here and exit before
     # the scenario it's testing ever gets a chance to run.
+    global _startup_self_check_done
     if os.getenv("SKIP_STARTUP_SELF_CHECK"):
         logger.warning("SKIPPING startup self-check (SKIP_STARTUP_SELF_CHECK is set).")
+    elif _startup_self_check_done:
+        logger.debug(
+            "Skipping startup self-check - already verified once this process."
+        )
     else:
         await _startup_self_check(stt, llm, tts)
+        _startup_self_check_done = True
 
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
