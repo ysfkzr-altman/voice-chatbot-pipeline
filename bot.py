@@ -142,17 +142,40 @@ def _load_fallback_audio() -> tuple[bytes, int, int] | None:
 
 FALLBACK_AUDIO = _load_fallback_audio()
 
-# Confirmed problem #12: very short utterances (backchannel-style sounds
-# like "Mm-hmm", or short interruption phrases like "Wait, stop") kept
+# Confirmed problem #12: short-to-medium English utterances (backchannel
+# sounds like "Mm-hmm", short interruption phrases, quick asides) kept
 # getting misclassified as Urdu gibberish instead of the English that was
 # actually said - short/ambiguous audio gives Whisper's Urdu pass just
 # enough room to produce a confidently-wrong result. Applied as a bonus to
 # the English candidate's confidence score, only when the winning
 # transcript is short enough to plausibly be one of these cases.
-SHORT_UTTERANCE_CHAR_THRESHOLD = 12
+#
+# 12 chars (the original value) turned out to only cover the single
+# original repro case ("Mm-hmm") - comprehensive audio testing afterward
+# found the same failure on longer, clearly-English utterances that this
+# threshold let straight through un-biased:
+#   "What is your name?"                 (19 chars, en=-0.519 ur=-0.426)
+#   "Wait, stop, never mind."             (24 chars, en=-0.328 ur=-0.164)
+#   "Thank you for watching this video."  (35 chars, en=-0.404 ur=-0.313)
+# Every one of these gaps is small (0.09-0.16) - consistent with Whisper's
+# forced-Urdu pass being genuinely uncertain but landing just confident
+# enough to win, not with these being borderline-real Urdu speech. Raised
+# to 40 to cover the longest confirmed case (35 chars) with real margin.
+#
+# Caveat worth knowing: Kokoro (the only TTS this project has) cannot
+# synthesize Urdu at all, so there is no way to generate a genuine Urdu
+# audio sample through this project's own eval harness to check this
+# threshold doesn't over-correct real Urdu speech in the 12-40 char range.
+# The 0.7 bias below is sized to flip only the small ambiguous gaps
+# measured above, not the presumably-larger gap a real, unambiguous Urdu
+# utterance would produce - but that assumption is untested with real
+# Urdu audio and should be revisited if Urdu-speaking users report the
+# bot misreading their speech as English.
+SHORT_UTTERANCE_CHAR_THRESHOLD = 40
 # 0.3 wasn't enough in practice - measured the real gap for "Mm-hmm"
 # directly (en=-0.717 vs ur=-0.212, a 0.5 gap) and it still lost. 0.7
-# comfortably covers the measured case with some margin.
+# comfortably covers every gap measured above (largest is 0.164) with
+# margin.
 SHORT_UTTERANCE_EN_BIAS = 0.7
 
 
@@ -758,43 +781,65 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         consecutive_fallback_failures = 0
         circuit_open_until = 0.0
 
-        if message.interrupted and message.content:
-            # Confirmed problem #9: when a response is cut off, pipecat
-            # still hands this handler the FULL generated text - and right
-            # after this handler returns, it broadcasts that same full
-            # text into the LLM context (LLMContextAssistantTurnFrame),
-            # regardless of how much was actually spoken before the
-            # interruption. Reproduced directly (a standalone context-dump
-            # probe): interrupting well under a second into a multi-sentence
-            # answer still left the complete, uncut text in context - the
-            # bot's memory claimed to have said things the user never
-            # actually heard.
+        if message.interrupted:
+            # Confirmed problem #9: the bot's memory of an interrupted
+            # response didn't match what the user actually heard.
             #
-            # There's no clean hook to prevent that broadcast (it happens
-            # in pipecat's own code, after this handler, using a local
-            # variable this handler can't reach) or to know precisely how
-            # much audio was actually played. This corrects the record
-            # after the fact instead: find the just-broadcast entry by its
-            # (still-unique-enough) exact text and replace it with an
-            # explicit marker, so a later turn can't be misled by a
-            # fabricated "I already told you that" when it wasn't heard.
+            # Two different failure shapes have been directly observed for
+            # this, from two different testing methods:
+            #
+            # 1. A standalone context-dump probe (earlier session) showed
+            #    pipecat broadcasting the FULL generated text into context
+            #    after an interruption, regardless of how much was actually
+            #    spoken - the bot's memory claimed to have said things the
+            #    user never heard.
+            # 2. Real audio-driven interruption testing (this session,
+            #    across 5 separate timings from 500ms to 5000ms, including
+            #    one where the LLM had already generated a full 314-char
+            #    answer and Kokoro had fully synthesized the first half of
+            #    it) instead showed message.content coming back completely
+            #    EMPTY every single time, and a follow-up context dump
+            #    confirmed pipecat adds NO assistant entry to context at
+            #    all in that case - not full text, not partial, nothing.
+            #    Traced to assistant_aggregator sitting downstream of
+            #    tts/transport.output() in the pipeline: an InterruptionFrame
+            #    flushes pending TTSTextFrames before they reach it, so it
+            #    never sees any of the generated text.
+            #
+            # Shape 2 is silent data loss rather than a false claim - the
+            # LLM ends up with zero memory it ever started answering, which
+            # can make it repeat itself or ignore that a partial answer was
+            # already given. Both shapes are handled below: replace the
+            # fabricated entry if pipecat broadcast one (shape 1), otherwise
+            # append an honest interruption marker so context still
+            # reflects that something happened (shape 2). Neither claims
+            # specifics about how much was actually heard - that isn't
+            # knowable from here.
             original_content = message.content
 
             async def _correct_interrupted_context():
                 await asyncio.sleep(0.2)
                 messages = context.get_messages()
-                for i in reversed(range(len(messages))):
-                    if (
-                        messages[i].get("role") == "assistant"
-                        and messages[i].get("content") == original_content
-                    ):
-                        messages[i]["content"] = (
-                            "[This response was interrupted by the user before finishing - "
-                            "only part of it was actually heard, not the complete answer.]"
-                        )
-                        context.set_messages(messages)
-                        logger.debug("Corrected interrupted assistant turn in context")
-                        break
+                marker = (
+                    "[This response was interrupted by the user before finishing - "
+                    "only part of it (if any) was actually heard, not the complete answer.]"
+                )
+                if original_content:
+                    for i in reversed(range(len(messages))):
+                        if (
+                            messages[i].get("role") == "assistant"
+                            and messages[i].get("content") == original_content
+                        ):
+                            messages[i]["content"] = marker
+                            context.set_messages(messages)
+                            logger.debug("Corrected interrupted assistant turn in context")
+                            return
+                # No matching (or any) assistant entry was broadcast for
+                # this turn - append the marker instead of silently losing
+                # the fact that an interruption happened at all.
+                messages.append({"role": "assistant", "content": marker})
+                context.set_messages(messages)
+                logger.debug("Recorded interruption marker for empty-content assistant turn")
 
             asyncio.create_task(_correct_interrupted_context())
 

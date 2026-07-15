@@ -1,0 +1,66 @@
+name: interrupted_context_test
+
+# Verifies the fix for confirmed problem #9 (the bot's memory of an
+# interrupted response didn't match what the user actually heard).
+#
+# bargein_test/thrashing_test interrupt only 700-900ms after llm_started -
+# too early for the LLM to have streamed any real content yet, so
+# message.content is empty and the correction code in bot.py
+# (on_assistant_turn_stopped -> _correct_interrupted_context) never has
+# anything to fix. This test interrupts much later (3500ms in) so the bot
+# has actually said several words before being cut off, which is the only
+# way to exercise the fix's real code path.
+#
+# Check the bot's own log for "Corrected interrupted assistant turn in
+# context" to confirm the fix actually engaged, not just that the
+# interruption itself was detected.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/interrupted_context_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+judge:
+  modality: audio
+  transcription:
+    service: moonshine
+
+turns:
+  - user: "Can you explain in detail how airplanes generate lift and stay in the air?"
+    expect:
+      - event: llm_started
+        within_ms: 8000
+
+  # Interrupt mid-PLAYBACK, not just mid-generation. Measured directly
+  # (tts_cleanliness_test's own bot log, "Bot started/stopped speaking"
+  # timestamps): a ~200-character response takes 2-4 additional seconds
+  # of actual audio playback after synthesis starts, on top of the
+  # ~1-2s of LLM/TTS TTFB before that. An earlier version of this test
+  # used no audio judge and a 3500ms delay - the interruption arrived
+  # AFTER Kokoro had already finished synthesizing and cleaned up the
+  # whole response, so nothing was actually in-flight to interrupt.
+  - user: "Wait, stop, never mind."
+    send_after:
+      event: llm_started
+      delay_ms: 5000
+    expect:
+      - event: user_started_speaking
+        within_ms: 4000
+
+  # Ask a clean follow-up afterward to confirm the pipeline recovered and
+  # isn't stuck believing it already said something it didn't.
+  - user: "What is two plus two?"
+    send_after:
+      event: user_started_speaking
+      delay_ms: 2000
+    expect:
+      - event: user_transcription
+        within_ms: 6000
+      - event: llm_response
+        within_ms: 10000

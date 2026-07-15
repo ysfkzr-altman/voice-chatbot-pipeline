@@ -1,0 +1,41 @@
+name: hallucination_filter_test
+
+# Verifies the Whisper-hallucination phrase filter added to BackchannelFilter
+# (EDGE_CASES.md B6/G1 - previously unmitigated). Synthesizes a well-known
+# Whisper hallucination phrase as the "user" audio and checks that the
+# transcript is still captured (proving the audio path works) but never
+# reaches the LLM as a real turn - inspect the bot's own log for "Dropping
+# known Whisper hallucination phrase" and confirm no new
+# "Generating chat from context" call follows it, the same way
+# backchannel_test's fix was verified.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/hallucination_filter_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Can you describe the water cycle in a few sentences?"
+    expect:
+      - event: llm_started
+        within_ms: 8000
+
+  # A well-documented Whisper hallucination phrase, spoken 900ms into the
+  # bot's response - same timing as backchannel_test, since the goal is
+  # identical: prove this text gets transcribed but never treated as a
+  # real follow-up question.
+  - user: "Thank you for watching this video."
+    send_after:
+      event: llm_started
+      delay_ms: 900
+    expect:
+      - event: user_started_speaking
+        within_ms: 4000
+      - event: user_transcription
+        within_ms: 6000
