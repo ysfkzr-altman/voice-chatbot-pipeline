@@ -26,6 +26,7 @@ Requires GROQ_API_KEY in a .env file.
 """
 
 import asyncio
+import dataclasses
 import os
 import re
 import sys
@@ -39,7 +40,7 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame
+from pipecat.frames.frames import ErrorFrame, Frame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -48,6 +49,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.models import BotLLMTextMessage, TextMessageData
 from pipecat.runner.types import EvalRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.runner.utils import create_transport
@@ -86,10 +88,12 @@ SYSTEM_INSTRUCTION = (
     "your replies are delivered back as text, not spoken - so normal written "
     "formatting is fine. "
     "You understand all languages. Always respond in English regardless of what language the user speaks in. "
-    "Keep every response short and direct — one or two "
-    "sentences by default, never more than a few. No filler, no preamble, no "
-    "restating the question, no hedging caveats. Answer exactly what was asked "
-    "and stop. "
+    "Your replies are read as text, not spoken aloud, so there's no need to "
+    "artificially shorten them the way a spoken answer would need to be - "
+    "give complete, useful answers (including specs, lists, or detail) when "
+    "the question calls for it. Still be direct: no filler, no unnecessary "
+    "preamble, no restating the question, no hedging caveats, and no padding "
+    "a simple answer just to sound thorough. "
     "If the user asks about the price of a Honda Civic, HR-V, or City, use "
     "the check_honda_price tool rather than guessing - never make up a price. "
     "For anything else about Honda Pakistan - specs, features, dealers, "
@@ -146,14 +150,29 @@ def _fetch_honda_homepage_sync() -> str:
 
 
 async def _get_honda_prices() -> dict[str, str]:
-    """Fetch + parse honda.com.pk's mega-menu prices, using a short-lived cache."""
+    """Fetch + parse honda.com.pk's mega-menu prices, using a short-lived cache.
+
+    Falls back to a stale cache rather than failing outright when a fresh
+    fetch fails - a fetch failure this instant doesn't mean a price learned
+    5 minutes ago is now wrong, so there's no reason to make the user wait
+    or get an error when good-enough data is already sitting in memory.
+    """
     global _price_cache, _price_cache_time
 
     now = time.monotonic()
     if _price_cache and (now - _price_cache_time) < _PRICE_CACHE_TTL_SECS:
         return _price_cache
 
-    html = await asyncio.to_thread(_fetch_honda_homepage_sync)
+    try:
+        html = await asyncio.to_thread(_fetch_honda_homepage_sync)
+    except curl_requests.exceptions.RequestException:
+        if _price_cache:
+            logger.warning(
+                f"Honda homepage fetch failed - falling back to a stale price "
+                f"cache ({now - _price_cache_time:.0f}s old) instead of failing."
+            )
+            return _price_cache
+        raise
 
     _price_cache = {
         name.strip().lower(): price for name, price in _HONDA_PRICE_PATTERN.findall(html)
@@ -182,6 +201,28 @@ async def check_honda_price(params: FunctionCallParams):
         logger.error(f"[tool call] check_honda_price: fetch failed: {e}")
         await params.result_callback(
             {"model": model, "found": False, "error": "could not reach honda.com.pk right now"}
+        )
+        return
+
+    if not prices:
+        # Confirmed directly: a 200 OK response with a bot-challenge page
+        # (or any HTML structure change) parses to zero prices with no
+        # exception raised at all - treating that the same as "this
+        # specific model doesn't exist" would silently tell users every
+        # single model is unavailable instead of signaling that the scrape
+        # itself is broken.
+        logger.error(
+            "[tool call] check_honda_price: fetch succeeded but zero prices "
+            "were parsed - site structure may have changed, or a "
+            "bot-challenge page was served instead of the real homepage."
+        )
+        await params.result_callback(
+            {
+                "model": model,
+                "found": False,
+                "error": "could not verify any prices right now - honda.com.pk "
+                "may be temporarily unreachable",
+            }
         )
         return
 
@@ -275,6 +316,13 @@ _page_text_cache: dict[str, str] = {}
 _page_text_cache_time: dict[str, float] = {}
 _PAGE_CACHE_TTL_SECS = 300.0
 _PAGE_TEXT_MAX_CHARS = 3000
+# A 200 OK response can still be a bot-challenge page or a near-empty error
+# page rather than real content - handing that to the LLM as if it were the
+# genuine page risks a hallucinated or nonsensical answer built from noise.
+# 200 is a conservative guess, not measured against the real site (these
+# pages typically run into the thousands of characters once script/style/
+# nav noise is stripped) - low risk of rejecting a legitimately terse page.
+_PAGE_TEXT_MIN_CHARS = 200
 
 
 def _fetch_and_extract_page_sync(slug: str) -> str:
@@ -330,19 +378,49 @@ async def browse_honda_page(params: FunctionCallParams):
 
     now = time.monotonic()
     cached = _page_text_cache.get(slug)
-    if cached is not None and (now - _page_text_cache_time.get(slug, 0)) < _PAGE_CACHE_TTL_SECS:
+    fresh_age = now - _page_text_cache_time.get(slug, 0)
+    if cached is not None and fresh_age < _PAGE_CACHE_TTL_SECS:
         text = cached
     else:
         try:
             text = await asyncio.to_thread(_fetch_and_extract_page_sync, slug)
         except curl_requests.exceptions.RequestException as e:
-            logger.error(f"[tool call] browse_honda_page: fetch failed for {slug!r}: {e}")
-            await params.result_callback(
-                {"topic": topic, "found": False, "error": "could not reach honda.com.pk right now"}
-            )
-            return
-        _page_text_cache[slug] = text
-        _page_text_cache_time[slug] = now
+            # Fall back to a stale cache rather than failing outright - same
+            # reasoning as _get_honda_prices' stale-cache fallback above.
+            if cached is not None:
+                logger.warning(
+                    f"[tool call] browse_honda_page: fetch failed for {slug!r}, "
+                    f"falling back to stale cache ({fresh_age:.0f}s old)."
+                )
+                text = cached
+            else:
+                logger.error(f"[tool call] browse_honda_page: fetch failed for {slug!r}: {e}")
+                await params.result_callback(
+                    {
+                        "topic": topic,
+                        "found": False,
+                        "error": "could not reach honda.com.pk right now",
+                    }
+                )
+                return
+        else:
+            _page_text_cache[slug] = text
+            _page_text_cache_time[slug] = now
+
+    if len(text) < _PAGE_TEXT_MIN_CHARS:
+        logger.error(
+            f"[tool call] browse_honda_page: fetched {slug!r} but got only "
+            f"{len(text)} chars of content - likely a bot-challenge page or "
+            f"a site change, not real page content."
+        )
+        await params.result_callback(
+            {
+                "topic": topic,
+                "found": False,
+                "error": "could not verify this page's content right now",
+            }
+        )
+        return
 
     logger.log(
         "CONVO", f"[tool call] browse_honda_page(topic={topic!r}) -> {slug} ({len(text)} chars)"
@@ -441,6 +519,46 @@ class BilingualGroqSTTService(GroqSTTService):
         return winner
 
 
+_HTML_TAG_PATTERN = re.compile(r"<[^>]*>")
+
+
+class TextSanitizer(FrameProcessor):
+    """Strips raw HTML tags from LLM output before it's delivered to the
+    client as an RTVI text message.
+
+    Defensive, not a fix for an observed bug: the system prompt here allows
+    normal written formatting (unlike the audio variant, which strips
+    everything before TTS), but nothing stops the LLM from occasionally
+    echoing back a stray HTML tag - e.g. leftover markup from a scraped
+    Honda page, or a rare hallucination. If whatever client eventually
+    renders these replies does markdown-to-HTML conversion without
+    sanitizing, an unfiltered raw tag reaching it is a real (if unlikely)
+    injection risk. Cheap insurance given this variant is the only one
+    whose system prompt invites rich formatting at all.
+
+    Known limitation: operates per-fragment, since RTVI streams one
+    "bot-llm-text" message per raw LLM token chunk rather than per complete
+    sentence (confirmed directly in pipecat's
+    RTVIObserver._handle_llm_text_frame - every LLMTextFrame is pushed to
+    the client immediately, unaggregated). Buffering into complete
+    sentences first (like the audio variant's TTSTextNormalizer does) would
+    add latency before any text reaches the client at all, defeating
+    real-time streaming - a tag split exactly across two separate streamed
+    fragments could theoretically slip through partially. A narrow, accepted
+    trade-off for keeping streaming immediate.
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TextFrame) and frame.text:
+            sanitized = _HTML_TAG_PATTERN.sub("", frame.text)
+            if sanitized != frame.text:
+                logger.warning(f"Stripped HTML-like tag from LLM output: {frame.text!r}")
+            await self.push_frame(dataclasses.replace(frame, text=sanitized), direction)
+            return
+        await self.push_frame(frame, direction)
+
+
 async def _startup_self_check(llm: GroqLLMService) -> None:
     """Validates the LLM actually works before accepting real traffic - not
     just that a key is present (already checked at import time), but that a
@@ -494,9 +612,14 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         settings=GroqLLMService.Settings(
             model="llama-3.3-70b-versatile",
             system_instruction=SYSTEM_INSTRUCTION,
-            # Hard cap backing up the "keep it short" system prompt instruction -
-            # bounds worst-case LLM generation time.
-            max_completion_tokens=150,
+            # The original 150-token cap existed to bound worst-case TTS
+            # synthesis time in the audio variant - that reason doesn't
+            # apply here (no TTS at all), and it was cutting off detailed
+            # answers (specs, comparisons) that a text reply can comfortably
+            # hold. Raised to a much larger backstop that only exists to
+            # guard against genuinely runaway/adversarial-prompt generation,
+            # not to keep everyday answers short.
+            max_completion_tokens=500,
         ),
     )
 
@@ -574,12 +697,15 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
 
             asyncio.create_task(_correct_interrupted_context())
 
+    text_sanitizer = TextSanitizer()
+
     pipeline = Pipeline(
         [
             transport.input(),  # Mic input
             stt,  # Speech -> text
             user_aggregator,  # Collect user turn
             llm,  # Generate response (text delivered to the client via RTVI below)
+            text_sanitizer,  # Strip any raw HTML tags before the client sees them
             transport.output(),  # Delivers RTVI text messages to the client - no TTS/audio
             assistant_aggregator,  # Collect assistant turn
         ]
