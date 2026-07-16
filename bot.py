@@ -44,6 +44,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
+    LLMAssistantAggregatorParams,
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
@@ -59,6 +60,9 @@ from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransp
 from pipecat.workers.runner import WorkerRunner
 
 load_dotenv(override=True)
+
+if "GROQ_API_KEY" not in os.environ:
+    sys.exit("GROQ_API_KEY is missing - add it to your .env file.")
 
 # Windows consoles default to cp1252, which can't encode Urdu/Arabic script.
 # Reconfigure stderr to UTF-8 before loguru attaches so transcripts print
@@ -90,7 +94,11 @@ SYSTEM_INSTRUCTION = (
     "the check_honda_price tool rather than guessing - never make up a price. "
     "For anything else about Honda Pakistan - specs, features, dealers, "
     "contact info, promotions, company info, policies - use the "
-    "browse_honda_page tool to check the real website rather than guessing."
+    "browse_honda_page tool to check the real website rather than guessing. "
+    "If the user's message is too short, vague, or ambiguous to answer "
+    "meaningfully (e.g. a single word like 'yes' or 'ok' with no clear "
+    "context), don't guess at what they might mean - ask a brief clarifying "
+    "question instead."
 )
 
 GREETING_MESSAGE = "Hi! How can I help you today?"
@@ -433,6 +441,48 @@ class BilingualGroqSTTService(GroqSTTService):
         return winner
 
 
+async def _startup_self_check(llm: GroqLLMService) -> None:
+    """Validates the LLM actually works before accepting real traffic - not
+    just that a key is present (already checked at import time), but that a
+    real call succeeds.
+
+    Scoped to just the LLM: this variant has no TTS, and STT/audio-input
+    concerns are out of scope here (same reasoning as BilingualGroqSTTService
+    and the rest of the audio-input layer - this variant intentionally
+    doesn't duplicate that verification).
+
+    A revoked/expired key or a Groq quota/permission issue would otherwise
+    only surface on the user's FIRST real turn, presenting as a mysterious
+    fallback message with no clear cause. Failing fast here is much easier
+    to diagnose than that.
+
+    Exits the process (does not raise) if the check fails, matching the
+    existing fail-fast behavior for a missing API key / port conflict.
+    """
+    try:
+        await llm._client.chat.completions.create(
+            model=llm._settings.model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_completion_tokens=1,
+        )
+    except Exception as e:
+        logger.error("Startup self-check FAILED - fix this before running the bot:")
+        logger.error(f"  - LLM (Groq chat completions, model={llm._settings.model}): {e}")
+        sys.exit(1)
+
+    logger.info("Startup self-check passed: LLM is working.")
+
+
+# pipecat spawns a fresh run_bot() per WebRTC connection
+# (background_tasks.add_task on every /api/offer request), so without this
+# flag every single connection would re-run the self-check - an extra API
+# round-trip added to that user's first-turn latency, and extra quota usage
+# per session instead of once per process. The LLM client itself (same API
+# key, same model) doesn't change between connections, so verifying it once
+# per process is enough.
+_startup_self_check_done = False
+
+
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
@@ -450,10 +500,27 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         ),
     )
 
+    global _startup_self_check_done
+    if os.getenv("SKIP_STARTUP_SELF_CHECK"):
+        logger.warning("SKIPPING startup self-check (SKIP_STARTUP_SELF_CHECK is set).")
+    elif _startup_self_check_done:
+        logger.debug("Skipping startup self-check - already verified once this process.")
+    else:
+        await _startup_self_check(llm)
+        _startup_self_check_done = True
+
     context = LLMContext(tools=[honda_price_tool, browse_honda_page_tool])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        # Bulletproofing: a long-running conversation would otherwise grow
+        # LLMContext unboundedly - every future turn resends the entire
+        # history, so cost/latency creep up forever and eventually risk
+        # hitting the model's real context limit. pipecat already ships a
+        # complete summarization mechanism for this - it's just OFF by
+        # default. Turning it on with its own sensible defaults rather than
+        # leaving this pipeline vulnerable to unbounded growth.
+        assistant_params=LLMAssistantAggregatorParams(enable_auto_context_summarization=True),
     )
 
     @user_aggregator.event_handler("on_user_turn_message_added")
@@ -463,6 +530,49 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     @assistant_aggregator.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message):
         logger.log("CONVO", f"Bot: {message.content}")
+        nonlocal consecutive_fallback_failures, circuit_open_until
+        # A real assistant turn completed successfully - close the circuit
+        # breaker below entirely, so a transient blip doesn't leave things
+        # backed off longer than necessary once the service has recovered.
+        consecutive_fallback_failures = 0
+        circuit_open_until = 0.0
+
+        if message.interrupted:
+            # Confirmed problem #9 (ported from the audio variant): the
+            # bot's memory of an interrupted response didn't match what the
+            # user actually got. Real audio-driven testing on the audio
+            # variant found message.content comes back empty on interruption
+            # - pipecat doesn't broadcast any assistant entry into context
+            # at all in that case, which is silent data loss (the LLM has
+            # zero memory it started answering) rather than the originally
+            # suspected fabricated-full-text case. Handles both: replaces
+            # the entry if pipecat did broadcast one, otherwise appends an
+            # honest interruption marker instead of silently losing the turn.
+            original_content = message.content
+
+            async def _correct_interrupted_context():
+                await asyncio.sleep(0.2)
+                messages = context.get_messages()
+                marker = (
+                    "[This response was interrupted by the user before finishing - "
+                    "only part of it (if any) was actually delivered, not the "
+                    "complete answer.]"
+                )
+                if original_content:
+                    for i in reversed(range(len(messages))):
+                        if (
+                            messages[i].get("role") == "assistant"
+                            and messages[i].get("content") == original_content
+                        ):
+                            messages[i]["content"] = marker
+                            context.set_messages(messages)
+                            logger.debug("Corrected interrupted assistant turn in context")
+                            return
+                messages.append({"role": "assistant", "content": marker})
+                context.set_messages(messages)
+                logger.debug("Recorded interruption marker for empty-content assistant turn")
+
+            asyncio.create_task(_correct_interrupted_context())
 
     pipeline = Pipeline(
         [
@@ -484,33 +594,60 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # enable_rtvi defaults to True - this is what turns the LLM's
         # streamed text into "bot-llm-text" messages sent to the client,
         # replacing what TTS used to do.
+        #
+        # Bulletproofing: made explicit rather than relying on the library
+        # default. If a connected user goes quiet this long, pipecat cancels
+        # this session's worker AND runner automatically, scoped to just
+        # that one connection (background_tasks.add_task spawns an
+        # independent bot()/run_bot()/WorkerRunner() per WebRTC connection).
+        idle_timeout_secs=300.0,
     )
 
-    last_fallback_speak_time = 0.0
+    # Confirmed problem #7 (ported from the audio variant): a flat
+    # per-attempt cooldown still lets the fallback fire indefinitely during
+    # a genuine outage (every FALLBACK_COOLDOWN_SECS, forever). This is a
+    # real circuit breaker instead: each consecutive failure doubles how
+    # long the circuit stays open (backoff grows 5s -> 10s -> 20s -> ...
+    # capped at CIRCUIT_BREAKER_MAX_BACKOFF_SECS), and a single successful
+    # turn (on_assistant_turn_stopped above) closes it again completely.
+    consecutive_fallback_failures = 0
+    circuit_open_until = 0.0
+    CIRCUIT_BREAKER_MAX_BACKOFF_SECS = 60.0
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(worker, frame: ErrorFrame):
-        nonlocal last_fallback_speak_time
+        nonlocal consecutive_fallback_failures, circuit_open_until
         logger.error(f"Pipeline error from {frame.processor}: {frame.error}")
         if frame.fatal:
             return
 
-        # General safety net: never fire the fallback more than once every
-        # FALLBACK_COOLDOWN_SECS, regardless of source (e.g. STT down on
-        # every turn).
         now = time.monotonic()
-        if now - last_fallback_speak_time < FALLBACK_COOLDOWN_SECS:
+        if now < circuit_open_until:
+            # Already backed off from a recent run of failures - stay quiet
+            # rather than sending (and failing) again immediately.
             return
-        last_fallback_speak_time = now
 
         # A non-fatal ErrorFrame (STT/LLM hiccup, rate limit, etc.) would
         # otherwise just get logged, leaving the user with no reply for that
         # turn. Send a short apology as a text message instead, so the
         # conversation can continue. Not added to LLM context, matching the
-        # original TTS-based fallback's behavior.
+        # original TTS-based fallback's behavior. Unlike the audio variant,
+        # there's no "apologizing through the broken service" risk here -
+        # this is a plain RTVI text push, not dependent on any AI service.
         logger.log("CONVO", f"Bot: {FALLBACK_ERROR_MESSAGE}")
         await worker.rtvi.push_transport_message(
             BotLLMTextMessage(data=TextMessageData(text=FALLBACK_ERROR_MESSAGE))
+        )
+
+        consecutive_fallback_failures += 1
+        backoff = min(
+            FALLBACK_COOLDOWN_SECS * (2 ** (consecutive_fallback_failures - 1)),
+            CIRCUIT_BREAKER_MAX_BACKOFF_SECS,
+        )
+        circuit_open_until = now + backoff
+        logger.error(
+            f"Circuit breaker: {consecutive_fallback_failures} consecutive failure(s), "
+            f"backing off fallback message for {backoff:.0f}s."
         )
 
     @worker.event_handler("on_pipeline_started")
@@ -601,12 +738,43 @@ async def run_local():
     await run_bot(transport, handle_sigint=True)
 
 
+def _check_port_available(host: str, port: int) -> None:
+    """Exit with a clear message if `port` is already bound.
+
+    pipecat's own WebRTC runner prints "Bot ready!" (see
+    `pipecat.runner.run.main`, which calls `_print_startup_message` before
+    `uvicorn.run`) BEFORE it actually attempts to bind the port - so a
+    second instance started against an already-used port prints a false
+    "ready" message and only fails later. Checking here, before handing
+    off to pipecat's runner at all, avoids that misleading sequence.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        try:
+            s.bind((host, port))
+        except OSError:
+            sys.exit(
+                f"Port {port} on {host} is already in use - is another "
+                f"instance of this bot already running?"
+            )
+
+
 if __name__ == "__main__":
     import asyncio
 
     if "--local" in sys.argv:
         asyncio.run(run_local())
     else:
-        from pipecat.runner.run import main
+        from pipecat.runner.run import RUNNER_HOST, RUNNER_PORT, main
+
+        # Mirrors pipecat's own --host/--port argparse defaults so this
+        # check targets the same address the runner will actually bind.
+        host = sys.argv[sys.argv.index("--host") + 1] if "--host" in sys.argv else RUNNER_HOST
+        port = (
+            int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else RUNNER_PORT
+        )
+        _check_port_available(host, port)
 
         main()
