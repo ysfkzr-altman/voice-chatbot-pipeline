@@ -1,5 +1,16 @@
 # Edge Case Testing — Voice AI Pipeline
 
+> **Note (text-output branch):** this document was written for, and is almost
+> entirely about, the **voice-in/voice-out** variant of this bot (the one on
+> the `fix-edge-cases` branch) — TTS crashes, spoken-output formatting,
+> barge-in audio playback, and similar issues that don't apply to this
+> variant at all, since it has no TTS or speaker output. It's kept here for
+> historical context (this is the original audit the whole project started
+> from) and because the STT/LLM-layer findings (section B, most of section C)
+> still apply to this variant's input pipeline. See this branch's own
+> `README.md` ("What's different from the voice variant") for what was
+> actually ported here versus deliberately left unaddressed.
+
 ## Summary
 
 Comprehensive edge case catalog for the `bot.py` voice AI pipeline (Groq Whisper STT → Groq LLM Llama 3.3 70B → Kokoro TTS, WebRTC or `--local` PyAudio). Cases are grouped by pipeline layer. Each entry notes its status: **CONFIRMED** (observed in testing), **EXPECTED** (not yet tested, behavior predicted from architecture), or **OPEN** (known issue, unresolved). See the plan file for the full testing methodology.
