@@ -1,0 +1,46 @@
+name: interrupted_context_test
+
+# Verifies the interrupted-response context-marker fix (ported from the
+# audio variant). Responses here complete far faster than in the audio
+# variant (no TTS synthesis/playback delay to interrupt into), so this
+# asks for a long, detailed answer and interrupts very early after
+# llm_started to maximize the chance of landing mid-generation. Check the
+# bot's own log for "Corrected interrupted assistant turn in context" or
+# "Recorded interruption marker for empty-content assistant turn" to
+# confirm the fix's code path actually engaged, not just that the
+# interruption itself was detected.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/interrupted_context_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Can you explain in great detail how a car engine's combustion cycle works, covering intake, compression, power, and exhaust?"
+    expect:
+      - event: llm_started
+        within_ms: 8000
+
+  - user: "Wait, stop, never mind."
+    send_after:
+      event: llm_started
+      delay_ms: 200
+    expect:
+      - event: user_started_speaking
+        within_ms: 4000
+
+  - user: "What is two plus two?"
+    send_after:
+      event: user_started_speaking
+      delay_ms: 2000
+    expect:
+      - event: user_transcription
+        within_ms: 6000
+      - event: llm_response
+        within_ms: 10000

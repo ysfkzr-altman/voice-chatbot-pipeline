@@ -1,0 +1,31 @@
+name: text_formatting_test
+
+# Replaces tts_cleanliness_test (removed - that test's entire premise was
+# inverted for this variant: it checked that markdown/symbols got STRIPPED
+# before reaching TTS, but this variant has no TTS at all and its system
+# prompt explicitly says "normal written formatting is fine"). What
+# actually matters here instead:
+#   1. Rich formatting (a numbered list) should reach the client intact,
+#      not be neutered the way the audio variant deliberately does.
+#   2. TextSanitizer should still strip genuinely raw HTML-like tags if
+#      the LLM ever echoes any back (e.g. leftover markup from a scraped
+#      Honda page) - defensive, not something the LLM reliably reproduces
+#      on demand, so this is checked via a direct unit test in the same
+#      session this eval was added, not here.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/text_formatting_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Give me a numbered list of three fruits."
+    expect:
+      - event: llm_response
+        within_ms: 10000

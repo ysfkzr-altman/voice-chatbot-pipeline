@@ -1,0 +1,28 @@
+name: ambiguous_input_test
+
+# Verifies the system prompt's clarifying-question instruction: a single
+# ambiguous word with no prior context ("Yes") should make the bot ask
+# what's being referred to, not hallucinate an answer to a question that
+# was never asked.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/ambiguous_input_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Yes"
+    expect:
+      - event: llm_response
+        eval: "Does the response ask the user to clarify or explain what they mean, rather than answering as if a specific question had been asked?"
+        within_ms: 10000
+    # NOTE: the `eval:` check above needs a working local judge (Ollama). If
+    # that's unavailable, check the raw llm_response text in the .eval.log
+    # instead - it should be a clarifying question (e.g. "What are you
+    # referring to?"), not a hallucinated answer.

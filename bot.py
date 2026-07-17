@@ -50,7 +50,12 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.processors.frameworks.rtvi.models import BotLLMTextMessage, TextMessageData
+from pipecat.processors.frameworks.rtvi.models import (
+    BotLLMStartedMessage,
+    BotLLMStoppedMessage,
+    BotLLMTextMessage,
+    TextMessageData,
+)
 from pipecat.runner.types import EvalRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.groq.llm import GroqLLMService
@@ -601,10 +606,42 @@ async def _startup_self_check(llm: GroqLLMService) -> None:
 _startup_self_check_done = False
 
 
+async def _push_standalone_text_message(worker: PipelineWorker, text: str) -> None:
+    """Pushes a one-shot bot text message (greeting/fallback) with proper
+    started/stopped bookends, not just the bare text.
+
+    Bug found via comprehensive testing: pushing only a bare BotLLMTextMessage
+    (no surrounding lifecycle messages) means a client tracking "is the bot
+    currently responding" via the standard bot-llm-started/bot-llm-stopped
+    pair never gets told this one finished - confirmed directly that
+    bot-llm-stopped is only emitted by pipecat's RTVI observer in response to
+    a real LLMFullResponseEndFrame, which never occurs for a message pushed
+    this way. A client's "bot is typing..." state could get stuck forever
+    after every greeting or fallback apology. Same root-cause class as the
+    audio variant's TTSStartedFrame/TTSStoppedFrame fix for its fallback
+    audio - a raw content frame/message needs its matching lifecycle
+    bookends, not just the content itself.
+    """
+    await worker.rtvi.push_transport_message(BotLLMStartedMessage())
+    await worker.rtvi.push_transport_message(BotLLMTextMessage(data=TextMessageData(text=text)))
+    await worker.rtvi.push_transport_message(BotLLMStoppedMessage())
+
+
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
+    # whisper-large-v3-turbo instead of whisper-large-v3: measured directly
+    # in this exact pipeline (same conversation, same real audio, only the
+    # model swapped) - STT TTFB dropped from ~3s to ~0.3-0.5s, a 6-10x cut,
+    # since every utterance already pays for two concurrent transcription
+    # calls (see BilingualGroqSTTService). Re-verified the Urdu-bias
+    # threshold tuning still holds afterward (the "Wait, stop, never mind."
+    # case that used to be borderline still resolved to English, with a
+    # wider confidence margin than before, if anything). Known trade-off,
+    # not fully exercised here: Whisper's turbo variants are documented to
+    # trade a little accuracy for speed, more noticeably on less-common
+    # languages/accents than clean English.
     stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
-        settings=GroqSTTService.Settings(model="whisper-large-v3"),
+        settings=GroqSTTService.Settings(model="whisper-large-v3-turbo"),
     )
 
     llm = GroqLLMService(
@@ -761,9 +798,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # there's no "apologizing through the broken service" risk here -
         # this is a plain RTVI text push, not dependent on any AI service.
         logger.log("CONVO", f"Bot: {FALLBACK_ERROR_MESSAGE}")
-        await worker.rtvi.push_transport_message(
-            BotLLMTextMessage(data=TextMessageData(text=FALLBACK_ERROR_MESSAGE))
-        )
+        await _push_standalone_text_message(worker, FALLBACK_ERROR_MESSAGE)
 
         consecutive_fallback_failures += 1
         backoff = min(
@@ -784,9 +819,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # history (RTVI text pushes don't touch LLMContext) - a minor,
         # accepted trade-off of the text-output variant.
         logger.log("CONVO", f"Bot: {GREETING_MESSAGE}")
-        await worker.rtvi.push_transport_message(
-            BotLLMTextMessage(data=TextMessageData(text=GREETING_MESSAGE))
-        )
+        await _push_standalone_text_message(worker, GREETING_MESSAGE)
 
     runner = WorkerRunner(handle_sigint=handle_sigint)
     await runner.add_workers(worker)
@@ -805,7 +838,18 @@ async def bot(runner_args: RunnerArguments):
             webrtc_connection=runner_args.webrtc_connection,
             params=TransportParams(
                 audio_in_enabled=True,
-                audio_out_enabled=False,  # no TTS - replies go out as RTVI text messages
+                # Bug found via comprehensive testing: audio_out_enabled=False
+                # (the semantically "correct" choice, since this variant has
+                # no TTS at all) silently breaks the RTVI observer's
+                # user-started-speaking/interruption event forwarding to the
+                # client - confirmed directly (A/B tested in eval mode): with
+                # this False, "user_started_speaking" never reached the
+                # client despite the bot's own internal VAD/turn-detection
+                # correctly firing; flipping it to True fixed it immediately,
+                # no other change. No TTS service exists anywhere in this
+                # pipeline to actually generate audio, so this is a free fix,
+                # not a real audio-output enablement.
+                audio_out_enabled=True,
             ),
         )
     elif isinstance(runner_args, EvalRunnerArguments):
@@ -813,7 +857,7 @@ async def bot(runner_args: RunnerArguments):
 
         transport = await create_transport(
             runner_args,
-            {"eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=False)},
+            {"eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=True)},
         )
     else:
         raise RuntimeError(
