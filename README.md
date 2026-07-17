@@ -37,7 +37,7 @@ On first run, Kokoro downloads its model files (~87 MB) to `~/.cache/pipecat/kok
 
 ## Testing
 
-`evals/` holds automated scenarios (synthesized speech via Kokoro, no human needed) covering the confirmed edge cases in `EDGE_CASES.md`. Run the whole suite:
+`evals/` holds automated scenarios (synthesized speech via Kokoro, no human needed) covering the confirmed problems documented in `Pending_Edge_Cases_and_Solutions.pdf` and the `Confirmed problem #N` comments throughout `bot.py`. Run the whole suite:
 
 ```
 scripts/run_all_evals.sh
