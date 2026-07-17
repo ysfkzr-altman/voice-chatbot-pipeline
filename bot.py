@@ -100,21 +100,35 @@ _DEFAULT_LOG_LEVEL = "WARNING" if _IS_LOCAL_MODE else "DEBUG"
 logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", _DEFAULT_LOG_LEVEL))
 
 
+# Bright cyan / bright green so the two speakers are visually distinct from
+# each other and from plain terminal text (default log lines, prompts,
+# etc.) - readable on both dark and light terminal themes since these are
+# the bright ANSI variants, not the dim base 8 colors.
+_YOU_COLOR = "\033[96m"
+_BOT_COLOR = "\033[92m"
+_COLOR_RESET = "\033[0m"
+
+
 def _clear_console_line() -> None:
     if _IS_LOCAL_MODE:
         sys.stderr.write("\r\033[K")
         sys.stderr.flush()
 
 
-def _print_chat(text: str) -> None:
-    """Clean chat-only console line for --local mode: bypasses loguru's
-    formatting (timestamp/level/module) entirely, and clears any pending
-    "thinking..." indicator first. No-op outside --local mode - a WebRTC
-    client renders its own UI from RTVI events, this isn't for it.
+def _print_chat(role: str, text: str) -> None:
+    """Clean, colored chat-only console line for --local mode: bypasses
+    loguru's formatting (timestamp/level/module) entirely, and clears any
+    pending "thinking..." indicator first. No-op outside --local mode - a
+    WebRTC client renders its own UI from RTVI events, this isn't for it.
+
+    Args:
+        role: "You" or "Bot" - picks the color and the printed label.
+        text: the message content (without the "Role: " prefix).
     """
     if _IS_LOCAL_MODE:
+        color = _YOU_COLOR if role == "You" else _BOT_COLOR
         _clear_console_line()
-        sys.stderr.write(text + "\n")
+        sys.stderr.write(f"{color}{role}: {text}{_COLOR_RESET}\n")
         sys.stderr.flush()
 
 
@@ -124,10 +138,11 @@ def _print_thinking() -> None:
     gap instead of leaving the console looking frozen. Deliberately printed
     with no trailing newline so _print_chat's next call can overwrite this
     exact line (via \\r + clear-line) instead of leaving it sitting above
-    the real reply once one arrives.
+    the real reply once one arrives. Same color as a real "Bot:" line so it
+    reads as a continuation of the same speaker once overwritten.
     """
     if _IS_LOCAL_MODE:
-        sys.stderr.write("Bot: thinking...")
+        sys.stderr.write(f"{_BOT_COLOR}Bot: thinking...{_COLOR_RESET}")
         sys.stderr.flush()
 
 SYSTEM_INSTRUCTION = (
@@ -728,7 +743,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     @user_aggregator.event_handler("on_user_turn_message_added")
     async def on_user_turn_message_added(aggregator, message):
         logger.log("CONVO", f"User: {message.content}")
-        _print_chat(f"You: {message.content}")
+        _print_chat("You", message.content)
         _print_thinking()
 
     @assistant_aggregator.event_handler("on_assistant_turn_stopped")
@@ -740,7 +755,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # content before the actual answer; printing those would just
         # flash blank lines instead of masking the wait as intended.
         if message.content:
-            _print_chat(f"Bot: {message.content}")
+            _print_chat("Bot", message.content)
         nonlocal consecutive_fallback_failures, circuit_open_until
         # A real assistant turn completed successfully - close the circuit
         # breaker below entirely, so a transient blip doesn't leave things
@@ -849,7 +864,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # there's no "apologizing through the broken service" risk here -
         # this is a plain RTVI text push, not dependent on any AI service.
         logger.log("CONVO", f"Bot: {FALLBACK_ERROR_MESSAGE}")
-        _print_chat(f"Bot: {FALLBACK_ERROR_MESSAGE}")
+        _print_chat("Bot", FALLBACK_ERROR_MESSAGE)
         await _push_standalone_text_message(worker, FALLBACK_ERROR_MESSAGE)
 
         consecutive_fallback_failures += 1
@@ -871,7 +886,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # history (RTVI text pushes don't touch LLMContext) - a minor,
         # accepted trade-off of the text-output variant.
         logger.log("CONVO", f"Bot: {GREETING_MESSAGE}")
-        _print_chat(f"Bot: {GREETING_MESSAGE}")
+        _print_chat("Bot", GREETING_MESSAGE)
         await _push_standalone_text_message(worker, GREETING_MESSAGE)
 
     runner = WorkerRunner(handle_sigint=handle_sigint)
