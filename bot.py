@@ -84,9 +84,51 @@ logger.remove(0)
 # what the bot said) - separate from DEBUG/INFO noise. Must be registered
 # before any sink references it by name.
 logger.level("CONVO", no=25, color="<green>", icon="")
-# Set LOG_LEVEL=DEBUG in the environment to also see per-turn diagnostics
-# (e.g. the raw STT transcript logged in UrduGroqSTTService._transcribe).
-logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "DEBUG"))
+
+# --local mode's console IS the product's UI (no browser client to render
+# anything) - defaulting it to full DEBUG output means every run is a wall
+# of pipeline internals instead of a conversation. WEBRTC_DEFAULT_LOG_LEVEL
+# is unchanged so nothing about that path is affected. Explicit LOG_LEVEL
+# always wins over either default, for real debugging when needed.
+# WARNING (not CONVO) is used here specifically so loguru's own sink stays
+# silent by default in --local mode - the plain-print chat UI below
+# (_print_chat/_print_thinking) is what actually renders the conversation
+# there now, not loguru's CONVO-level lines (which still fire, for anyone
+# who sets LOG_LEVEL=CONVO or DEBUG explicitly and wants the old behavior).
+_IS_LOCAL_MODE = "--local" in sys.argv
+_DEFAULT_LOG_LEVEL = "WARNING" if _IS_LOCAL_MODE else "DEBUG"
+logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", _DEFAULT_LOG_LEVEL))
+
+
+def _clear_console_line() -> None:
+    if _IS_LOCAL_MODE:
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+
+def _print_chat(text: str) -> None:
+    """Clean chat-only console line for --local mode: bypasses loguru's
+    formatting (timestamp/level/module) entirely, and clears any pending
+    "thinking..." indicator first. No-op outside --local mode - a WebRTC
+    client renders its own UI from RTVI events, this isn't for it.
+    """
+    if _IS_LOCAL_MODE:
+        _clear_console_line()
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
+
+
+def _print_thinking() -> None:
+    """Shows a "Bot: thinking..." placeholder immediately after the user's
+    turn is captured, masking the STT-already-done-but-LLM-still-generating
+    gap instead of leaving the console looking frozen. Deliberately printed
+    with no trailing newline so _print_chat's next call can overwrite this
+    exact line (via \\r + clear-line) instead of leaving it sitting above
+    the real reply once one arrives.
+    """
+    if _IS_LOCAL_MODE:
+        sys.stderr.write("Bot: thinking...")
+        sys.stderr.flush()
 
 SYSTEM_INSTRUCTION = (
     "You are a helpful assistant. The user is speaking to you out loud, but "
@@ -686,10 +728,19 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     @user_aggregator.event_handler("on_user_turn_message_added")
     async def on_user_turn_message_added(aggregator, message):
         logger.log("CONVO", f"User: {message.content}")
+        _print_chat(f"You: {message.content}")
+        _print_thinking()
 
     @assistant_aggregator.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(aggregator, message):
         logger.log("CONVO", f"Bot: {message.content}")
+        # Only the real, final reply should replace "thinking..." - a
+        # tool-calling turn fires this same event once per intermediate
+        # step first (function-call, then function-result) with empty
+        # content before the actual answer; printing those would just
+        # flash blank lines instead of masking the wait as intended.
+        if message.content:
+            _print_chat(f"Bot: {message.content}")
         nonlocal consecutive_fallback_failures, circuit_open_until
         # A real assistant turn completed successfully - close the circuit
         # breaker below entirely, so a transient blip doesn't leave things
@@ -798,6 +849,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # there's no "apologizing through the broken service" risk here -
         # this is a plain RTVI text push, not dependent on any AI service.
         logger.log("CONVO", f"Bot: {FALLBACK_ERROR_MESSAGE}")
+        _print_chat(f"Bot: {FALLBACK_ERROR_MESSAGE}")
         await _push_standalone_text_message(worker, FALLBACK_ERROR_MESSAGE)
 
         consecutive_fallback_failures += 1
@@ -819,6 +871,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # history (RTVI text pushes don't touch LLMContext) - a minor,
         # accepted trade-off of the text-output variant.
         logger.log("CONVO", f"Bot: {GREETING_MESSAGE}")
+        _print_chat(f"Bot: {GREETING_MESSAGE}")
         await _push_standalone_text_message(worker, GREETING_MESSAGE)
 
     runner = WorkerRunner(handle_sigint=handle_sigint)
