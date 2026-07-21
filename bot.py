@@ -9,14 +9,17 @@ console (CONVO log line), since there's no client to receive a text message.
 Pipeline: mic (WebRTC or local) -> Silero VAD -> Groq STT (Whisper)
           -> Groq LLM (Llama 3.3 70B) -> text delivered via RTVI (no TTS)
 
-Also includes worked examples of LLM tool calling against a REAL website
-(honda.com.pk), not fake/hardcoded data:
-  - check_honda_price: real, live starting prices from the homepage's
-    mega-menu.
-  - browse_honda_page: fetches and reads any of a known set of real pages
-    on the site (model specs/features, dealer contact info, promotions,
-    company info, policies) so the bot can answer open-ended questions
-    about the site's actual content, not just price.
+Also includes worked examples of LLM tool calling against TWO REAL websites,
+not fake/hardcoded data:
+
+  Honda Pakistan (honda.com.pk):
+    - check_honda_price: real, live starting prices from the homepage mega-menu.
+    - browse_honda_page: fetches any known page (specs, dealers, promotions, etc.)
+
+  MG Motors Pakistan (mgmotors.com.pk):
+    - browse_mg_page: fetches any known page (model specs, dealers, financing,
+      offers, contact info, etc.) MG does not publish prices on their site, so
+      there is no price tool — the bot will direct users to contact a dealer.
 
 Run:
     python bot.py             # WebRTC server; open http://localhost:7860
@@ -161,6 +164,12 @@ SYSTEM_INSTRUCTION = (
     "For anything else about Honda Pakistan - specs, features, dealers, "
     "contact info, promotions, company info, policies - use the "
     "browse_honda_page tool to check the real website rather than guessing. "
+    "For any question about MG Motors Pakistan - model specs, features, "
+    "dealers, contact info, offers, financing, after-sales service - use the "
+    "browse_mg_page tool to check the real mgmotors.com.pk website. "
+    "MG Motors Pakistan does not publish car prices on their website, so if "
+    "the user asks for an MG price, tell them prices are not listed online "
+    "and suggest they contact a dealer or visit mgmotors.com.pk/dealer-locator. "
     "If the user's message is too short, vague, or ambiguous to answer "
     "meaningfully (e.g. a single word like 'yes' or 'ok' with no clear "
     "context), don't guess at what they might mean - ask a brief clarifying "
@@ -510,6 +519,185 @@ browse_honda_page_tool = FunctionSchema(
     handler=browse_honda_page,
 )
 
+# ---------------------------------------------------------------------------
+# MG Motors Pakistan (mgmotors.com.pk) tools
+# ---------------------------------------------------------------------------
+# MG Motors Pakistan does not publish car prices on their public website
+# (unlike Honda's homepage mega-menu). All model and info pages are
+# accessible without Cloudflare blocking (confirmed via direct testing -
+# curl_cffi Chrome impersonation used anyway for consistency and resilience).
+
+MG_BASE_URL = "https://mgmotors.com.pk"
+
+MG_PAGE_SLUGS = {
+    # Model pages - slugs confirmed from the site's own navigation links
+    "hs super hybrid": "model/mg-hs-super-hybrid",
+    "mg hs super hybrid": "model/mg-hs-super-hybrid",
+    "hs hybrid+": "model/mg-hs-hybrid-plus",
+    "mg hs hybrid+": "model/mg-hs-hybrid-plus",
+    "hs hybrid plus": "model/mg-hs-hybrid-plus",
+    "mg hs hybrid plus": "model/mg-hs-hybrid-plus",
+    "hs phev": "model/phev",
+    "mg hs phev": "model/phev",
+    "phev": "model/phev",
+    "hs": "model/mg-hs-super-hybrid",
+    "mg hs": "model/mg-hs-super-hybrid",
+    "u9": "model/mgu9",
+    "mg u9": "model/mgu9",
+    "mgu9": "model/mgu9",
+    "mg4": "model/mg4-ev-urban",
+    "mg4 ev": "model/mg4-ev-urban",
+    "mg4 ev urban": "model/mg4-ev-urban",
+    "cyberster": "model/cyberster",
+    "mg cyberster": "model/cyberster",
+    "binguo": "model/binguo",
+    "binguo ev": "model/binguo",
+    # Info / service pages
+    "about": "about",
+    "about mg": "about",
+    "contact": "contact",
+    "contact us": "contact",
+    "dealer": "dealer-locator",
+    "dealers": "dealer-locator",
+    "dealer locator": "dealer-locator",
+    "find dealer": "dealer-locator",
+    "locations": "dealer-locator",
+    "financing": "mg-partnerships",
+    "finance": "mg-partnerships",
+    "bank partnerships": "mg-partnerships",
+    "partnerships": "mg-partnerships",
+    "offers": "world-of-mg",
+    "promotions": "world-of-mg",
+    "news": "world-of-mg",
+    "events": "world-of-mg",
+    "world of mg": "world-of-mg",
+    "after sales": "care",
+    "after-sales": "care",
+    "service": "care",
+    "care": "care",
+    "faqs": "faqs",
+    "faq": "faqs",
+    "exchange": "mg-exchange",
+    "mg exchange": "mg-exchange",
+    "trade in": "mg-exchange",
+    "trade-in": "mg-exchange",
+    "test drive": "test-drive",
+    "book test drive": "test-drive",
+    "track": "track-my-mg",
+    "track my mg": "track-my-mg",
+    "order status": "track-my-mg",
+    "careers": "careers",
+    "privacy": "privacy-policy",
+    "privacy policy": "privacy-policy",
+}
+
+_mg_page_text_cache: dict[str, str] = {}
+_mg_page_text_cache_time: dict[str, float] = {}
+
+
+def _fetch_mg_page_sync(slug: str) -> str:
+    url = f"{MG_BASE_URL}/{slug}"
+    response = curl_requests.get(url, impersonate="chrome", timeout=10)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "noscript", "svg"]):
+        tag.decompose()
+    text = " ".join(soup.get_text(separator=" ", strip=True).split())
+    return text[:_PAGE_TEXT_MAX_CHARS]
+
+
+async def browse_mg_page(params: FunctionCallParams):
+    """Tool handler: fetches and reads a real page on mgmotors.com.pk."""
+    topic = str(params.arguments.get("topic", "")).strip().lower()
+    slug = MG_PAGE_SLUGS.get(topic)
+
+    if slug is None:
+        slug = next(
+            (s for key, s in MG_PAGE_SLUGS.items() if key in topic or topic in key),
+            None,
+        )
+
+    if slug is None:
+        logger.log("CONVO", f"[tool call] browse_mg_page(topic={topic!r}) -> no match")
+        await params.result_callback(
+            {
+                "topic": topic,
+                "found": False,
+                "available_topics": sorted(set(MG_PAGE_SLUGS.keys())),
+            }
+        )
+        return
+
+    now = time.monotonic()
+    cached = _mg_page_text_cache.get(slug)
+    fresh_age = now - _mg_page_text_cache_time.get(slug, 0)
+    if cached is not None and fresh_age < _PAGE_CACHE_TTL_SECS:
+        text = cached
+    else:
+        try:
+            text = await asyncio.to_thread(_fetch_mg_page_sync, slug)
+        except curl_requests.exceptions.RequestException as e:
+            if cached is not None:
+                logger.warning(
+                    f"[tool call] browse_mg_page: fetch failed for {slug!r}, "
+                    f"falling back to stale cache ({fresh_age:.0f}s old)."
+                )
+                text = cached
+            else:
+                logger.error(f"[tool call] browse_mg_page: fetch failed for {slug!r}: {e}")
+                await params.result_callback(
+                    {
+                        "topic": topic,
+                        "found": False,
+                        "error": "could not reach mgmotors.com.pk right now",
+                    }
+                )
+                return
+        else:
+            _mg_page_text_cache[slug] = text
+            _mg_page_text_cache_time[slug] = now
+
+    if len(text) < _PAGE_TEXT_MIN_CHARS:
+        logger.error(
+            f"[tool call] browse_mg_page: fetched {slug!r} but got only "
+            f"{len(text)} chars - likely a bot-challenge page or site change."
+        )
+        await params.result_callback(
+            {
+                "topic": topic,
+                "found": False,
+                "error": "could not verify this page's content right now",
+            }
+        )
+        return
+
+    logger.log(
+        "CONVO", f"[tool call] browse_mg_page(topic={topic!r}) -> {slug} ({len(text)} chars)"
+    )
+    await params.result_callback({"topic": topic, "found": True, "page_content": text})
+
+
+browse_mg_page_tool = FunctionSchema(
+    name="browse_mg_page",
+    description=(
+        "Fetch and read a real page from the mgmotors.com.pk website to answer "
+        "questions about MG Motors Pakistan - model specs/features, dealer "
+        "locations, financing/bank partnerships, offers, after-sales service, "
+        "contact info, or company info. MG does not list prices on their site."
+    ),
+    properties={
+        "topic": {
+            "type": "string",
+            "description": (
+                "What to look up, e.g. 'MG HS specs', 'dealer locations', "
+                "'financing', 'MG4 EV', 'Cyberster', 'contact', 'offers'."
+            ),
+        }
+    },
+    required=["topic"],
+    handler=browse_mg_page,
+)
+
 
 def _avg_logprob(result: Transcription) -> float:
     """Mean segment log-probability, used as a confidence proxy.
@@ -704,7 +892,11 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     llm = GroqLLMService(
         api_key=os.environ["GROQ_API_KEY"],
         settings=GroqLLMService.Settings(
-            model="llama-3.3-70b-versatile",
+            # llama3-groq-70b-8192-tool-use-preview is Groq's dedicated
+            # tool-calling variant: specifically fine-tuned for function
+            # calling, higher rate limits than llama-3.3-70b-versatile,
+            # and far better tool-use accuracy than the 8B instant model.
+            model="llama3-groq-70b-8192-tool-use-preview",
             system_instruction=SYSTEM_INSTRUCTION,
             # The original 150-token cap existed to bound worst-case TTS
             # synthesis time in the audio variant - that reason doesn't
@@ -726,7 +918,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         await _startup_self_check(llm)
         _startup_self_check_done = True
 
-    context = LLMContext(tools=[honda_price_tool, browse_honda_page_tool])
+    context = LLMContext(tools=[honda_price_tool, browse_honda_page_tool, browse_mg_page_tool])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
